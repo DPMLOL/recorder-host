@@ -397,6 +397,11 @@ bool Recorder::create_audio_tracks(obs_data_array_t *tracks, std::string &error)
     }
 
     obs_source_t *source = obs_source_create(source_id, ("audio:" + track_id).c_str(), settings, nullptr);
+    // A mic on input 1 of a stereo interface (Focusrite "Analogue 1 + 2") only fills the left channel.
+    obs_data_set_default_bool(entry, "mono", strcmp(kind, "input") == 0);
+    if (obs_data_get_bool(entry, "mono")) {
+      obs_source_set_flags(source, obs_source_get_flags(source) | OBS_SOURCE_FLAG_FORCE_MONO);
+    }
     obs_source_set_audio_mixers(source, 1u << track);
     obs_set_output_source((uint32_t)(kFirstAudioChannel + track), source);
     audio_sources_.emplace_back(source);

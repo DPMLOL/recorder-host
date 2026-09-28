@@ -35,7 +35,8 @@ Commands (`id` is echoed back on replies and errors):
 | `shutdown` | – |
 
 `window` uses OBS's `title:class:exe` form and defaults to League's game window. `deviceId` comes from `info.inputs`.
-Audio tracks keep the order of `audio` (MPEG-TS stores no track titles). A process track captures the app's process tree
+Audio tracks keep the order of `audio` (MPEG-TS stores no track titles). Inputs are downmixed to mono unless `mono: false`
+(a mic on input 1 of a stereo interface would otherwise sit in the left ear only). A process track captures the app's process tree
 wherever it plays (WASAPI process loopback), so the output device no longer matters.
 
 In segment mode OBS splits on keyframes (GOP = `seconds`) into `{prefix}_000000.ts`, `{prefix}_000001.ts`, … and the host
