@@ -32,7 +32,7 @@ createInterface({ input: proc.stdout }).on('line', (line) => {
     send({
       cmd: 'start',
       id: 1,
-      path: join(outDir, 'ingame.mkv').replace(/\\/g, '/'),
+      output: { path: join(outDir, 'ingame.mkv').replace(/\\/g, '/') },
       video: { source: 'game', width: 1920, height: 1080, fps: 60 },
       audio: [
         { id: 'system', kind: 'process', executable: 'League of Legends.exe' },
