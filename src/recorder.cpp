@@ -77,6 +77,10 @@ bool Recorder::init() {
     return false;
   }
 
+  // Allowlist: UI plugins (frontend-tools, decklink-output-ui) abort without a Qt frontend.
+  for (const char *module : {"win-capture", "win-wasapi", "obs-ffmpeg", "obs-nvenc", "obs-qsv11", "obs-x264"}) {
+    obs_add_safe_module(module);
+  }
   obs_load_all_modules();
   obs_log_loaded_modules();
   obs_post_load_modules();
@@ -248,7 +252,7 @@ void Recorder::start(long long id, obs_data_t *params) {
     unhooked_.Connect(sh, "unhooked", on_unhooked, this);
   }
 
-  scene_ = obs_scene_create("dpm");
+  scene_ = obs_scene_create_private("dpm");
   obs_sceneitem_t *item = obs_scene_add(scene_, video_source_);
   vec2 bounds;
   vec2_set(&bounds, (float)width_, (float)height_);
