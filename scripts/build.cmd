@@ -72,6 +72,13 @@ if "%SIGN%"=="1" (
 if "%COPY%"=="1" (
     echo [build] dist
     node "%ROOT%\scripts\dist.mjs" "%INSTALL%" "%DEPS%" "%DUMPBIN%" "%ROOT%\build\dist" || exit /b 1
+    REM Everything DPM ships is signed, like electron-overlay: unsigned DLLs next to a signed app trip AV heuristics.
+    for /r "%ROOT%\build\dist" %%f in (*.exe *.dll) do (
+        powershell -NoProfile -Command "if ((Get-AuthenticodeSignature '%%f').Status -ne 'Valid') { exit 1 }" >nul 2>&1
+        if errorlevel 1 (
+            smctl sign --simple --keypair-alias %DPM_SIGN_KEYPAIR% --input "%%f" >nul || (echo ERROR: signing %%~nxf failed & exit /b 1)
+        )
+    )
     if not defined DPM_APP_RECORDER_HOST_DIR set "DPM_APP_RECORDER_HOST_DIR=%ROOT%\..\dpmlol\apps\app\recorder-host"
     if exist "!DPM_APP_RECORDER_HOST_DIR!" rmdir /s /q "!DPM_APP_RECORDER_HOST_DIR!"
     xcopy /e /i /q /y "%ROOT%\build\dist" "!DPM_APP_RECORDER_HOST_DIR!" >nul || exit /b 1
