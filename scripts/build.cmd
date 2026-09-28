@@ -5,12 +5,20 @@ REM
 REM   scripts\build.cmd          build
 REM   scripts\build.cmd --sign   + sign the binaries injected into or launched against the game (smctl, DigiCert KeyLocker)
 REM
+REM   scripts\build.cmd --sign --copy   + assemble build\dist (what DPM ships) and copy it into the DPM app
+REM
 REM Env: DPM_SIGN_KEYPAIR (smctl keypair alias, needed with --sign)
+REM      DPM_APP_RECORDER_HOST_DIR (default: the sibling checkout's dpmlol\apps\app\recorder-host)
 
 set "ROOT=%~dp0.."
 set "INSTALL=%ROOT%\build\obs-install"
 set "SIGN=0"
-for %%a in (%*) do if "%%a"=="--sign" set "SIGN=1"
+set "COPY=0"
+for %%a in (%*) do (
+    if "%%a"=="--sign" set "SIGN=1"
+    if "%%a"=="--copy" set "COPY=1"
+)
+if "%COPY%"=="1" if "%SIGN%"=="0" (echo ERROR: --copy needs --sign: Vanguard refuses an unsigned graphics hook. & exit /b 1)
 
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 where cmake >nul 2>&1 && (set "CMAKE=cmake") || (
@@ -59,6 +67,15 @@ if "%SIGN%"=="1" (
         REM --simple signs service-side; without it smctl needs the DigiCert KSP installed locally.
         smctl sign --simple --keypair-alias %DPM_SIGN_KEYPAIR% --input "%%~f" || (echo ERROR: signing %%~nxf failed & exit /b 1)
     )
+)
+
+if "%COPY%"=="1" (
+    echo [build] dist
+    node "%ROOT%\scripts\dist.mjs" "%INSTALL%" "%DEPS%" "%DUMPBIN%" "%ROOT%\build\dist" || exit /b 1
+    if not defined DPM_APP_RECORDER_HOST_DIR set "DPM_APP_RECORDER_HOST_DIR=%ROOT%\..\dpmlol\apps\app\recorder-host"
+    if exist "!DPM_APP_RECORDER_HOST_DIR!" rmdir /s /q "!DPM_APP_RECORDER_HOST_DIR!"
+    xcopy /e /i /q /y "%ROOT%\build\dist" "!DPM_APP_RECORDER_HOST_DIR!" >nul || exit /b 1
+    echo [build] copied to !DPM_APP_RECORDER_HOST_DIR!
 )
 
 echo [build] done: %INSTALL%\bin\64bit\recorder-host.exe
