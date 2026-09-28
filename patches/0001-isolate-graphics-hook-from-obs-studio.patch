@@ -1,5 +1,5 @@
 diff --git a/plugins/win-capture/game-capture-file-init.c b/plugins/win-capture/game-capture-file-init.c
-index dc4f3c2..9a9273d 100644
+index dc4f3c2..9e2cd8b 100644
 --- a/plugins/win-capture/game-capture-file-init.c
 +++ b/plugins/win-capture/game-capture-file-init.c
 @@ -151,7 +151,7 @@ char *get_hook_path(bool b64)
@@ -11,7 +11,35 @@ index dc4f3c2..9a9273d 100644
  	make_filename(path, L"graphics-hook", L".dll");
  
  	if ((b64 && programdata64_hook_exists) || (!b64 && programdata32_hook_exists)) {
-@@ -199,7 +199,7 @@ static bool update_hook_file(bool b64)
+@@ -171,6 +171,27 @@ char *get_hook_path(bool b64)
+ #undef warn
+ #define warn(format, ...) blog(LOG_WARNING, "update_hook_file: " format, ##__VA_ARGS__)
+ 
++static bool files_differ(const wchar_t *a, const wchar_t *b)
++{
++	bool differ = true;
++	HANDLE fa = CreateFileW(a, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
++	HANDLE fb = CreateFileW(b, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
++	LARGE_INTEGER sa, sb;
++	if (fa != INVALID_HANDLE_VALUE && fb != INVALID_HANDLE_VALUE && GetFileSizeEx(fa, &sa) && GetFileSizeEx(fb, &sb) &&
++	    sa.QuadPart == sb.QuadPart) {
++		char ba[65536], bb[65536];
++		DWORD ra = 0, rb = 0;
++		differ = false;
++		while (!differ && ReadFile(fa, ba, sizeof(ba), &ra, NULL) && ReadFile(fb, bb, sizeof(bb), &rb, NULL) && ra > 0)
++			differ = ra != rb || memcmp(ba, bb, ra) != 0;
++	}
++	if (fa != INVALID_HANDLE_VALUE)
++		CloseHandle(fa);
++	if (fb != INVALID_HANDLE_VALUE)
++		CloseHandle(fb);
++	return differ;
++}
++
+ static bool update_hook_file(bool b64)
+ {
+ 	wchar_t temp[MAX_PATH];
+@@ -199,7 +220,7 @@ static bool update_hook_file(bool b64)
  		return false;
  	}
  
@@ -20,7 +48,54 @@ index dc4f3c2..9a9273d 100644
  	StringCbCopyW(dst_json, sizeof(dst_json), temp);
  	StringCbCopyW(dst, sizeof(dst), temp);
  	make_filename(dst_json, L"obs-vulkan", L".json");
-@@ -288,7 +288,7 @@ static void init_vulkan_registry(bool b64)
+@@ -237,41 +258,13 @@ static bool update_hook_file(bool b64)
+ 	if (has_elevation())
+ 		add_aap_perms(temp);
+ 
+-	struct win_version_info ver_src = {0};
+-	struct win_version_info ver_dst = {0};
+-	if (!get_dll_ver(src, &ver_src)) {
+-		warn("failed to get version of source");
+-		return false;
+-	}
+-#ifndef _DEBUG
+-	if (!get_dll_ver(dst, &ver_dst)) {
+-		warn("failed to get version of %ls", dst);
+-		return false;
+-	}
+-#endif
+-
+-	/* if source is greater than dst, overwrite new file  */
+-	while (win_version_compare(&ver_dst, &ver_src) < 0) {
+-		if (!CopyFileW(src_json, dst_json, false)) {
++	/* DPM: re-signed builds keep the same version, so compare contents rather than versions.
++	 * A copy that fails (hook loaded in a running game) keeps the current file. */
++	if (files_differ(src, dst) || files_differ(src_json, dst_json)) {
++		if (!CopyFileW(src_json, dst_json, false))
+ 			warn("failed to update %ls (%lu)", dst_json, GetLastError());
+-			return false;
+-		}
+-		if (!CopyFileW(src, dst, false)) {
++		if (!CopyFileW(src, dst, false))
+ 			warn("failed to update %ls (%lu)", dst, GetLastError());
+-			return false;
+-		}
+-
+-		if (!get_dll_ver(dst, &ver_dst)) {
+-			warn("failed to get version of %ls", dst);
+-			return false;
+-		}
+-	}
+-
+-	/* do not use if major version incremented in target compared to
+-	 * ours */
+-	if (ver_dst.major > ver_src.major) {
+-		warn("target %ls has major version %d, source has major version %d", dst, ver_dst.major, ver_src.major);
+-		return false;
+ 	}
+ 
+ 	return true;
+@@ -288,7 +281,7 @@ static void init_vulkan_registry(bool b64)
  	LSTATUS s;
  
  	wchar_t path[MAX_PATH];
