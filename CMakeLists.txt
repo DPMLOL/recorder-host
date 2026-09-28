@@ -8,6 +8,9 @@ list(APPEND CMAKE_PREFIX_PATH "${OBS_INSTALL_DIR}/cmake" ${OBS_DEPS_DIR})
 find_package(libobs REQUIRED CONFIG)
 
 add_executable(recorder-host
+  src/audio_apps.cpp
+  src/audio_tracks.cpp
+  src/loudness.cpp
   src/main.cpp
   src/protocol.cpp
   src/recorder.cpp

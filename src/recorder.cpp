@@ -1,5 +1,6 @@
 #include "recorder.h"
 
+#include "audio_apps.h"
 #include "protocol.h"
 #include "wall_clock.h"
 
@@ -7,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <mutex>
 
@@ -17,12 +19,11 @@ constexpr uint32_t kDefaultWidth = 1920;
 constexpr uint32_t kDefaultHeight = 1080;
 constexpr uint32_t kDefaultFps = 60;
 constexpr long long kKeyframesPerAnchorCheck = 30;
-// Channel 0 is the scene; audio sources follow.
-constexpr uint32_t kFirstAudioChannel = 1;
+constexpr auto kStopTimeout = std::chrono::seconds(30);
 
+// Outputs signal their stop from their own threads; stop() waits for all of them here.
 std::mutex stop_mutex;
 std::condition_variable stop_cv;
-bool output_stopped = true;
 
 bool encoder_registered(const char *id) {
   const char *type = nullptr;
@@ -65,6 +66,12 @@ std::string base_name(const std::string &path) {
   return slash == std::string::npos ? path : path.substr(slash + 1);
 }
 
+void set_db(obs_data_t *event, const char *key, double db) {
+  if (std::isfinite(db)) {
+    obs_data_set_double(event, key, db);
+  }
+}
+
 }  // namespace
 
 bool Recorder::init() {
@@ -86,7 +93,8 @@ bool Recorder::init() {
   }
 
   // Allowlist: UI plugins (frontend-tools, decklink-output-ui) abort without a Qt frontend.
-  for (const char *module : {"win-capture", "win-wasapi", "obs-ffmpeg", "obs-nvenc", "obs-qsv11", "obs-x264"}) {
+  for (const char *module :
+       {"win-capture", "win-wasapi", "obs-ffmpeg", "obs-outputs", "obs-nvenc", "obs-qsv11", "obs-x264"}) {
     obs_add_safe_module(module);
   }
   obs_load_all_modules();
@@ -96,10 +104,13 @@ bool Recorder::init() {
 }
 
 void Recorder::shutdown() {
-  if (output_ && obs_output_active(output_)) {
-    obs_output_force_stop(output_);
+  for (OutputSlot *slot : {&segments_, &vod_}) {
+    if (slot->output && obs_output_active(slot->output)) {
+      obs_output_force_stop(slot->output);
+    }
   }
   release_session();
+  audio_.release();
   // Sources are destroyed on a background queue; shutting down before it drains reports them as leaked.
   obs_wait_for_destroy_queue();
   obs_shutdown();
@@ -115,6 +126,14 @@ void Recorder::handle(obs_data_t *command) {
     start(id, command);
   } else if (strcmp(cmd, "stop") == 0) {
     stop(id);
+  } else if (strcmp(cmd, "monitor") == 0) {
+    monitor(id, command);
+  } else if (strcmp(cmd, "set_volume") == 0) {
+    set_volume(id, command);
+  } else if (strcmp(cmd, "loudness") == 0) {
+    loudness(id, command);
+  } else if (strcmp(cmd, "audio_apps") == 0) {
+    audio_apps(id);
   } else {
     protocol::send_error(cmd, id, "unknown command");
   }
@@ -216,41 +235,71 @@ obs_source_t *Recorder::create_video_source(obs_data_t *video, std::string &erro
   return obs_source_create("game_capture", "game", settings, nullptr);
 }
 
+bool Recorder::recording() const {
+  return segments_.running || vod_.running;
+}
+
+bool Recorder::start_output(OutputSlot &slot, const char *type, obs_data_t *settings, std::string &error) {
+  slot.output = obs_output_create(type, slot.name, settings, nullptr);
+  if (!slot.output) {
+    error = std::string("cannot create ") + type;
+    return false;
+  }
+  obs_output_set_video_encoder(slot.output, video_encoder_);
+  const auto &encoders = audio_.encoders();
+  for (size_t track = 0; track < encoders.size(); track++) {
+    obs_output_set_audio_encoder(slot.output, encoders[track], track);
+  }
+  slot.start_signal.Connect(obs_output_get_signal_handler(slot.output), "start", on_output_start, &slot);
+  slot.stop_signal.Connect(obs_output_get_signal_handler(slot.output), "stop", on_output_stop, &slot);
+  {
+    std::lock_guard lock(stop_mutex);
+    slot.running = true;
+  }
+  if (!obs_output_start(slot.output)) {
+    const char *last = obs_output_get_last_error(slot.output);
+    error = std::string(slot.name) + " output start failed: " + (last ? last : "unknown");
+    std::lock_guard lock(stop_mutex);
+    slot.running = false;
+    return false;
+  }
+  return true;
+}
+
 void Recorder::start(long long id, obs_data_t *params) {
-  if (output_ && obs_output_active(output_)) {
+  if (recording()) {
     protocol::send_error("start", id, "already recording");
     return;
   }
   release_session();
 
-  // Output: one file (path), or a ring of fixed-length MPEG-TS segments named {prefix}_{000000}.ts.
+  // The ring: fixed-length MPEG-TS segments named {prefix}_{000000}.ts, which clips are cut from.
   OBSDataAutoRelease out = obs_data_get_obj(params, "output");
   OBSDataAutoRelease segments = out ? obs_data_get_obj(out, "segments") : nullptr;
-  std::string path = out ? obs_data_get_string(out, "path") : "";
-  uint32_t segment_seconds = 0;
-  OBSDataAutoRelease output_settings = obs_data_create();
-  if (segments) {
-    const std::string directory = obs_data_get_string(segments, "directory");
-    const std::string prefix = obs_data_get_string(segments, "prefix");
-    segment_seconds = (uint32_t)obs_data_get_int(segments, "seconds");
-    if (directory.empty() || prefix.empty() || segment_seconds == 0) {
-      protocol::send_error("start", id, "segments needs directory, prefix and seconds");
-      return;
-    }
-    path = directory + "/" + prefix + "_000000.ts";
-    obs_data_set_bool(output_settings, "split_file", true);
-    obs_data_set_int(output_settings, "max_time_sec", segment_seconds);
-    obs_data_set_int(output_settings, "max_size_mb", 0);
-    obs_data_set_bool(output_settings, "allow_overwrite", true);
-    obs_data_set_string(output_settings, "directory", directory.c_str());
-    obs_data_set_string(output_settings, "format", (prefix + "_{seq}").c_str());
-    obs_data_set_string(output_settings, "extension", "ts");
-  }
-  if (path.empty()) {
-    protocol::send_error("start", id, "missing output.path or output.segments");
+  if (!segments) {
+    protocol::send_error("start", id, "missing output.segments");
     return;
   }
-  obs_data_set_string(output_settings, "path", path.c_str());
+  const std::string directory = obs_data_get_string(segments, "directory");
+  const std::string prefix = obs_data_get_string(segments, "prefix");
+  const uint32_t segment_seconds = (uint32_t)obs_data_get_int(segments, "seconds");
+  if (directory.empty() || prefix.empty() || segment_seconds == 0) {
+    protocol::send_error("start", id, "segments needs directory, prefix and seconds");
+    return;
+  }
+  const std::string first_segment = directory + "/" + prefix + "_000000.ts";
+  OBSDataAutoRelease segment_settings = obs_data_create();
+  obs_data_set_string(segment_settings, "path", first_segment.c_str());
+  obs_data_set_bool(segment_settings, "split_file", true);
+  obs_data_set_int(segment_settings, "max_time_sec", segment_seconds);
+  obs_data_set_int(segment_settings, "max_size_mb", 0);
+  obs_data_set_bool(segment_settings, "allow_overwrite", true);
+  obs_data_set_string(segment_settings, "directory", directory.c_str());
+  obs_data_set_string(segment_settings, "format", (prefix + "_{seq}").c_str());
+  obs_data_set_string(segment_settings, "extension", "ts");
+  // The replay, written as the game plays: Hybrid MP4 stays readable if anything crashes, and needs
+  // no remux at the end.
+  vod_path_ = obs_data_get_string(out, "vod");
 
   OBSDataAutoRelease video = obs_data_get_obj(params, "video");
   if (!video) {
@@ -287,8 +336,9 @@ void Recorder::start(long long id, obs_data_t *params) {
   obs_sceneitem_set_bounds(item, &bounds);
   obs_set_output_source(0, obs_scene_get_source(scene_));
 
+  // Recording replaces any mixer monitoring: the same sources would be opened twice.
   OBSDataArrayAutoRelease tracks = obs_data_get_array(params, "audio");
-  if (!create_audio_tracks(tracks, error)) {
+  if (!audio_.create(tracks, error) || !audio_.create_encoders(error)) {
     protocol::send_error("start", id, error);
     release_session();
     return;
@@ -299,7 +349,7 @@ void Recorder::start(long long id, obs_data_t *params) {
   obs_data_set_string(encoder_settings, "rate_control", "CBR");
   obs_data_set_int(encoder_settings, "bitrate", obs_data_get_int(video, "bitrateKbps"));
   // Segments split on keyframes, so the GOP is the segment length.
-  obs_data_set_int(encoder_settings, "keyint_sec", segment_seconds ? segment_seconds : 2);
+  obs_data_set_int(encoder_settings, "keyint_sec", segment_seconds);
   video_encoder_ = obs_video_encoder_create(encoder_id, "video", encoder_settings, nullptr);
   if (!video_encoder_) {
     protocol::send_error("start", id, std::string("video encoder creation failed: ") + encoder_id);
@@ -308,148 +358,162 @@ void Recorder::start(long long id, obs_data_t *params) {
   }
   obs_encoder_set_video(video_encoder_, obs_get_video());
 
-  output_ = obs_output_create("ffmpeg_muxer", "file", output_settings, nullptr);
-  obs_output_set_video_encoder(output_, video_encoder_);
-  for (size_t track = 0; track < audio_encoders_.size(); track++) {
-    obs_output_set_audio_encoder(output_, audio_encoders_[track], track);
-  }
-
-  signal_handler_t *sh = obs_output_get_signal_handler(output_);
-  output_start_.Connect(sh, "start", on_output_start, this);
-  output_stop_.Connect(sh, "stop", on_output_stop, this);
-  file_changed_.Connect(sh, "file_changed", on_file_changed, this);
-  obs_output_add_packet_callback(output_, on_packet, this);
-
   {
     std::lock_guard lock(clock_mutex_);
     keyframes_ = 0;
     anchored_ = false;
     last_keyframe_wall_ms_ = 0;
     last_video_wall_ms_ = 0;
-    segmented_ = segments != nullptr;
-    segment_file_ = segmented_ ? base_name(path) : "";
+    segment_file_ = base_name(first_segment);
     segment_start_wall_ms_ = 0;
   }
-  {
-    std::lock_guard lock(stop_mutex);
-    output_stopped = false;
-  }
-  if (!obs_output_start(output_)) {
-    const char *last = obs_output_get_last_error(output_);
-    protocol::send_error("start", id, std::string("output start failed: ") + (last ? last : "unknown"));
-    {
-      std::lock_guard lock(stop_mutex);
-      output_stopped = true;
-    }
+  audio_.start_loudness();
+
+  if (!start_output(segments_, "ffmpeg_muxer", segment_settings, error)) {
+    protocol::send_error("start", id, error);
     release_session();
     return;
+  }
+  file_changed_.Connect(obs_output_get_signal_handler(segments_.output), "file_changed", on_file_changed, this);
+  obs_output_add_packet_callback(segments_.output, on_packet, this);
+
+  if (!vod_path_.empty()) {
+    OBSDataAutoRelease vod_settings = obs_data_create();
+    obs_data_set_string(vod_settings, "path", vod_path_.c_str());
+    if (!start_output(vod_, "mp4_output", vod_settings, error)) {
+      // The ring still records: clips work, and DPM can assemble the replay from it.
+      blog(LOG_WARNING, "%s", error.c_str());
+      OBSDataAutoRelease warning = obs_data_create();
+      obs_data_set_string(warning, "event", "warning");
+      obs_data_set_string(warning, "message", error.c_str());
+      protocol::send(warning);
+      vod_.output = nullptr;
+      vod_path_.clear();
+    }
   }
 
   OBSDataAutoRelease event = obs_data_create();
   obs_data_set_string(event, "event", "starting");
   obs_data_set_int(event, "id", id);
   obs_data_set_string(event, "encoder", encoder_id);
-  obs_data_set_string(event, "path", path.c_str());
+  obs_data_set_string(event, "path", first_segment.c_str());
+  obs_data_set_string(event, "vod", vod_path_.c_str());
   obs_data_set_int(event, "width", width_);
   obs_data_set_int(event, "height", height_);
   obs_data_set_int(event, "fps", fps_);
+  OBSDataArrayAutoRelease ids = obs_data_array_create();
+  for (const std::string &track : audio_.track_ids()) {
+    OBSDataAutoRelease entry = obs_data_create();
+    obs_data_set_string(entry, "id", track.c_str());
+    obs_data_array_push_back(ids, entry);
+  }
+  obs_data_set_array(event, "tracks", ids);
   protocol::send(event);
 }
 
-// One track per entry, in order: {id, kind: "process", executable | window} or {id, kind: "input", deviceId}.
-// The id becomes the encoder name, which the muxer writes as the stream title.
-bool Recorder::create_audio_tracks(obs_data_array_t *tracks, std::string &error) {
-  const size_t count = tracks ? obs_data_array_count(tracks) : 0;
-  if (count > MAX_AUDIO_MIXES) {
-    error = "at most " + std::to_string(MAX_AUDIO_MIXES) + " audio tracks";
-    return false;
-  }
-
-  OBSDataAutoRelease aac_settings = obs_data_create();
-  obs_data_set_int(aac_settings, "bitrate", 160);
-  for (size_t track = 0; track < count; track++) {
-    OBSDataAutoRelease entry = obs_data_array_item(tracks, track);
-    const std::string track_id = obs_data_get_string(entry, "id");
-    const char *kind = obs_data_get_string(entry, "kind");
-    if (track_id.empty()) {
-      error = "audio track without id";
-      return false;
-    }
-
-    OBSDataAutoRelease settings = obs_data_create();
-    const char *source_id = nullptr;
-    if (strcmp(kind, "process") == 0) {
-      // title:class:exe; with exe priority an empty title and class match any window of the executable.
-      std::string window = obs_data_get_string(entry, "window");
-      if (window.empty()) {
-        window = std::string("::") + obs_data_get_string(entry, "executable");
-      }
-      obs_data_set_string(settings, "window", window.c_str());
-      obs_data_set_int(settings, "priority", WINDOW_PRIORITY_EXE);
-      source_id = "wasapi_process_output_capture";
-    } else if (strcmp(kind, "input") == 0) {
-      const char *device = obs_data_get_string(entry, "deviceId");
-      obs_data_set_string(settings, "device_id", *device ? device : "default");
-      source_id = "wasapi_input_capture";
-    } else {
-      error = "audio track " + track_id + ": unknown kind";
-      return false;
-    }
-
-    obs_source_t *source = obs_source_create(source_id, ("audio:" + track_id).c_str(), settings, nullptr);
-    // A mic on input 1 of a stereo interface (Focusrite "Analogue 1 + 2") only fills the left channel.
-    obs_data_set_default_bool(entry, "mono", strcmp(kind, "input") == 0);
-    if (obs_data_get_bool(entry, "mono")) {
-      obs_source_set_flags(source, obs_source_get_flags(source) | OBS_SOURCE_FLAG_FORCE_MONO);
-    }
-    obs_source_set_audio_mixers(source, 1u << track);
-    obs_set_output_source((uint32_t)(kFirstAudioChannel + track), source);
-    audio_sources_.emplace_back(source);
-
-    obs_encoder_t *encoder = obs_audio_encoder_create("ffmpeg_aac", track_id.c_str(), aac_settings, track, nullptr);
-    obs_encoder_set_audio(encoder, obs_get_audio());
-    audio_encoders_.emplace_back(encoder);
-  }
-  return true;
-}
-
 void Recorder::stop(long long id) {
-  if (!output_ || !obs_output_active(output_)) {
+  if (!recording()) {
     release_session();
     protocol::send_error("stop", id, "not recording");
     return;
   }
 
-  obs_output_stop(output_);
-  // The muxer flushes asynchronously; sources are only released once the file is closed.
+  for (OutputSlot *slot : {&segments_, &vod_}) {
+    if (slot->output && slot->running) {
+      obs_output_stop(slot->output);
+    }
+  }
+  // Muxers flush asynchronously; sources are only released once every file is closed.
   std::unique_lock lock(stop_mutex);
-  if (!stop_cv.wait_for(lock, std::chrono::seconds(30), [] { return output_stopped; })) {
+  if (!stop_cv.wait_for(lock, kStopTimeout, [this] { return !recording(); })) {
     lock.unlock();
-    blog(LOG_WARNING, "output did not stop within 30 s, forcing");
-    obs_output_force_stop(output_);
+    blog(LOG_WARNING, "outputs did not stop within 30 s, forcing");
+    for (OutputSlot *slot : {&segments_, &vod_}) {
+      if (slot->output && obs_output_active(slot->output)) {
+        obs_output_force_stop(slot->output);
+      }
+    }
   } else {
     lock.unlock();
   }
+
+  OBSDataAutoRelease event = obs_data_create();
+  obs_data_set_string(event, "event", "stopped");
+  obs_data_set_int(event, "id", id);
+  obs_data_set_string(event, "vod", vod_path_.c_str());
+  // The whole recording's mix, measured as it played: the replay's normalisation gain needs no second pass.
+  set_db(event, "loudnessLufs", audio_.loudness_lufs(0));
+  set_db(event, "peakDb", audio_.peak_dbfs(0));
   release_session();
+  protocol::send(event);
+}
+
+// The mixer's live view outside a game: the same sources as a recording, with meters, and nothing written.
+void Recorder::monitor(long long id, obs_data_t *params) {
+  if (recording()) {
+    protocol::send_error("monitor", id, "recording");
+    return;
+  }
+  OBSDataArrayAutoRelease tracks = obs_data_get_array(params, "audio");
+  std::string error;
+  if (!audio_.create(tracks, error)) {
+    protocol::send_error("monitor", id, error);
+    return;
+  }
+  OBSDataAutoRelease event = obs_data_create();
+  obs_data_set_string(event, "event", "monitoring");
+  obs_data_set_int(event, "id", id);
+  protocol::send(event);
+}
+
+void Recorder::set_volume(long long id, obs_data_t *params) {
+  if (!audio_.set_volume(obs_data_get_string(params, "track"), obs_data_get_double(params, "volume"))) {
+    protocol::send_error("set_volume", id, "no such track");
+    return;
+  }
+  OBSDataAutoRelease event = obs_data_create();
+  obs_data_set_string(event, "event", "ok");
+  obs_data_set_int(event, "id", id);
+  protocol::send(event);
+}
+
+// Loudness and peak of the mix since a wall-clock instant: a clip's window, without decoding it again.
+void Recorder::loudness(long long id, obs_data_t *params) {
+  const double since = obs_data_get_double(params, "sinceWallMs");
+  OBSDataAutoRelease event = obs_data_create();
+  obs_data_set_string(event, "event", "loudness");
+  obs_data_set_int(event, "id", id);
+  set_db(event, "loudnessLufs", audio_.loudness_lufs(since));
+  set_db(event, "peakDb", audio_.peak_dbfs(since));
+  protocol::send(event);
+}
+
+void Recorder::audio_apps(long long id) {
+  OBSDataArrayAutoRelease apps = obs_data_array_create();
+  list_audio_apps(apps);
+  OBSDataAutoRelease event = obs_data_create();
+  obs_data_set_string(event, "event", "audio_apps");
+  obs_data_set_int(event, "id", id);
+  obs_data_set_array(event, "apps", apps);
+  protocol::send(event);
 }
 
 void Recorder::release_session() {
-  output_start_.Disconnect();
-  output_stop_.Disconnect();
   file_changed_.Disconnect();
   hooked_.Disconnect();
   unhooked_.Disconnect();
-  if (output_) {
-    obs_output_remove_packet_callback(output_, on_packet, this);
+  if (segments_.output) {
+    obs_output_remove_packet_callback(segments_.output, on_packet, this);
+  }
+  for (OutputSlot *slot : {&segments_, &vod_}) {
+    slot->start_signal.Disconnect();
+    slot->stop_signal.Disconnect();
+    slot->output = nullptr;
+    slot->running = false;
   }
   obs_set_output_source(0, nullptr);
-  for (size_t track = 0; track < audio_sources_.size(); track++) {
-    obs_set_output_source((uint32_t)(kFirstAudioChannel + track), nullptr);
-  }
-  output_ = nullptr;
   video_encoder_ = nullptr;
-  audio_encoders_.clear();
-  audio_sources_.clear();
+  audio_.release();
   scene_ = nullptr;
   video_source_ = nullptr;
 }
@@ -483,7 +547,7 @@ void Recorder::on_packet(obs_output_t *, encoder_packet *pkt, encoder_packet_tim
     return;
   }
   self->last_keyframe_wall_ms_ = wall_ms;
-  if (self->segmented_ && self->segment_start_wall_ms_ == 0) {
+  if (self->segment_start_wall_ms_ == 0) {
     self->segment_start_wall_ms_ = wall_ms;
   }
 
@@ -514,31 +578,37 @@ void Recorder::on_file_changed(void *param, calldata_t *cd) {
   self->segment_start_wall_ms_ = self->last_keyframe_wall_ms_;
 }
 
-void Recorder::on_output_start(void *, calldata_t *) {
-  protocol::send_event("started");
+// The ring writing means the recording is live; the replay output follows the same encoders.
+void Recorder::on_output_start(void *param, calldata_t *) {
+  auto *slot = static_cast<OutputSlot *>(param);
+  if (slot == &slot->owner->segments_) {
+    protocol::send_event("started");
+  }
 }
 
 void Recorder::on_output_stop(void *param, calldata_t *cd) {
-  auto *self = static_cast<Recorder *>(param);
-  {
+  auto *slot = static_cast<OutputSlot *>(param);
+  Recorder *self = slot->owner;
+  const long long code = calldata_int(cd, "code");
+  if (slot == &self->segments_) {
     // The last segment ends one frame after its last picture, not at a nominal segment length.
     std::lock_guard lock(self->clock_mutex_);
-    if (self->segmented_) {
-      self->close_segment(self->last_video_wall_ms_ + (self->fps_ ? 1000.0 / self->fps_ : 0));
-      self->segment_file_.clear();
-    }
+    self->close_segment(self->last_video_wall_ms_ + (self->fps_ ? 1000.0 / self->fps_ : 0));
+    self->segment_file_.clear();
   }
 
+  // A non-zero code outside stop() means the output died on its own (disk full, encoder lost).
   OBSDataAutoRelease event = obs_data_create();
-  obs_data_set_string(event, "event", "stopped");
-  obs_data_set_int(event, "code", calldata_int(cd, "code"));
+  obs_data_set_string(event, "event", "output_stopped");
+  obs_data_set_string(event, "output", slot->name);
+  obs_data_set_int(event, "code", code);
   if (const char *last = calldata_string(cd, "last_error")) {
     obs_data_set_string(event, "error", last);
   }
   protocol::send(event);
 
   std::lock_guard lock(stop_mutex);
-  output_stopped = true;
+  slot->running = false;
   stop_cv.notify_all();
 }
 

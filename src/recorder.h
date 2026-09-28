@@ -1,10 +1,11 @@
 #pragma once
 
+#include "audio_tracks.h"
+
 #include <obs.hpp>
 
 #include <mutex>
 #include <string>
-#include <vector>
 
 class Recorder {
  public:
@@ -14,15 +15,29 @@ class Recorder {
   void handle(obs_data_t *command);
 
  private:
+  struct OutputSlot {
+    Recorder *owner = nullptr;
+    const char *name = "";
+    OBSOutputAutoRelease output;
+    OBSSignal start_signal;
+    OBSSignal stop_signal;
+    bool running = false;
+  };
+
   void info(long long id);
   void start(long long id, obs_data_t *params);
   void stop(long long id);
+  void monitor(long long id, obs_data_t *params);
+  void set_volume(long long id, obs_data_t *params);
+  void loudness(long long id, obs_data_t *params);
+  void audio_apps(long long id);
   void release_session();
+  bool recording() const;
 
   bool reset_video(uint32_t width, uint32_t height, uint32_t fps);
   obs_source_t *create_video_source(obs_data_t *video, std::string &error);
-  bool create_audio_tracks(obs_data_array_t *tracks, std::string &error);
   static const char *pick_video_encoder(const char *requested);
+  bool start_output(OutputSlot &slot, const char *type, obs_data_t *settings, std::string &error);
 
   void close_segment(double end_wall_ms);
 
@@ -39,10 +54,12 @@ class Recorder {
 
   OBSSceneAutoRelease scene_;
   OBSSourceAutoRelease video_source_;
-  std::vector<OBSSourceAutoRelease> audio_sources_;
+  AudioTracks audio_;
   OBSEncoderAutoRelease video_encoder_;
-  std::vector<OBSEncoderAutoRelease> audio_encoders_;
-  OBSOutputAutoRelease output_;
+  // The ring clips are cut from, and the whole game written as it plays (the replay).
+  OutputSlot segments_{this, "segments"};
+  OutputSlot vod_{this, "vod"};
+  std::string vod_path_;
 
   // Written on the output thread (packets, file changes), read at stop.
   std::mutex clock_mutex_;
@@ -50,13 +67,10 @@ class Recorder {
   bool anchored_ = false;
   double last_keyframe_wall_ms_ = 0;
   double last_video_wall_ms_ = 0;
-  bool segmented_ = false;
   std::string segment_file_;
   double segment_start_wall_ms_ = 0;
 
   // Declared after what they watch so they disconnect first.
-  OBSSignal output_start_;
-  OBSSignal output_stop_;
   OBSSignal file_changed_;
   OBSSignal hooked_;
   OBSSignal unhooked_;
