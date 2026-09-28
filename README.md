@@ -17,7 +17,7 @@ scripts\build.cmd --sign     # + signs graphics-hook, inject-helper, get-graphic
 The script initialises `obs-studio/` (submodule pinned to 32.2.2), applies `patches/`, builds OBS without
 frontend/browser/websocket/scripting, builds the host, then copies the obs-deps DLLs the binaries really import.
 
-`patches/0001` renames graphics-hook's kernel objects (`DPMCaptureHook_*`) and its ProgramData folder
+`patches/0001-dpm.patch` numbers split files (`{seq}` in the file name format), refreshes the hook copy when its contents change, and renames graphics-hook's kernel objects (`DPMCaptureHook_*`) and its ProgramData folder
 (`dpm-recorder-hook`), so our hook never collides with an OBS Studio installed on the same machine.
 
 ## Protocol
@@ -30,14 +30,19 @@ Commands (`id` is echoed back on replies and errors):
 | cmd | params |
 |---|---|
 | `info` | – |
-| `start` | `path`, `video: {source: "game" \| "monitor", window?, width?, height?, fps?, bitrateKbps?, encoder?}`, `audio: {game?: {window?}, mic?: {deviceId?}}` |
+| `start` | `output: {path} | {segments: {directory, prefix, seconds}}`, `video: {source: "game" | "monitor", window?, width?, height?, fps?, bitrateKbps?, encoder?}`, `audio: [{id, kind: "process", executable | window} | {id, kind: "input", deviceId}]` (6 max) |
 | `stop` | – |
 | `shutdown` | – |
 
 `window` uses OBS's `title:class:exe` form and defaults to League's game window. `deviceId` comes from `info.inputs`.
-Audio track 1 is the game (process loopback, any output device), track 2 the microphone.
+Audio tracks keep the order of `audio` (MPEG-TS stores no track titles). A process track captures the app's process tree
+wherever it plays (WASAPI process loopback), so the output device no longer matters.
 
-Events: `ready`, `info`, `starting`, `started`, `stopped {code, error?}`, `hooked {title, class, executable}`,
+In segment mode OBS splits on keyframes (GOP = `seconds`) into `{prefix}_000000.ts`, `{prefix}_000001.ts`, … and the host
+sends `segment {file, startWallMs, endWallMs}` as each one closes, like a line of ffmpeg's segment list. The first
+segment can be longer than `seconds`.
+
+Events: `ready`, `info`, `starting {encoder, path, width, height, fps}`, `started`, `segment`, `stopped {code, error?}`, `hooked {title, class, executable}`,
 `unhooked`, `anchor`, `error {cmd, id, message}`.
 
 ### Anchor

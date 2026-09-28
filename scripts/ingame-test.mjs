@@ -34,7 +34,10 @@ createInterface({ input: proc.stdout }).on('line', (line) => {
       id: 1,
       path: join(outDir, 'ingame.mkv').replace(/\\/g, '/'),
       video: { source: 'game', width: 1920, height: 1080, fps: 60 },
-      audio: { game: {}, mic: { deviceId: args.mic ?? 'default' } },
+      audio: [
+        { id: 'system', kind: 'process', executable: 'League of Legends.exe' },
+        { id: 'mic', kind: 'input', deviceId: args.mic ?? 'default' },
+      ],
     });
     setTimeout(stop, seconds * 1000);
   }

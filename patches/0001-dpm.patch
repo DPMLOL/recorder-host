@@ -1,3 +1,47 @@
+diff --git a/plugins/obs-ffmpeg/obs-ffmpeg-mux.c b/plugins/obs-ffmpeg/obs-ffmpeg-mux.c
+index f152b28..7077617 100644
+--- a/plugins/obs-ffmpeg/obs-ffmpeg-mux.c
++++ b/plugins/obs-ffmpeg/obs-ffmpeg-mux.c
+@@ -403,6 +403,7 @@ static inline bool ffmpeg_mux_start_internal(struct ffmpeg_muxer *stream, obs_da
+ 		stream->allow_overwrite = obs_data_get_bool(settings, "allow_overwrite");
+ 		stream->cur_size = 0;
+ 		stream->sent_headers = false;
++		stream->split_seq = 0;
+ 	}
+ 
+ 	ts_offset_clear(stream);
+@@ -581,6 +582,18 @@ static void generate_filename(struct ffmpeg_muxer *stream, struct dstr *dst, boo
+ 
+ 	char *filename = os_generate_formatted_filename(ext, space, fmt);
+ 
++	/* DPM: {seq} numbers split files, the first one (settings path) being 0 */
++	if (strstr(filename, "{seq}")) {
++		struct dstr seq_name = {0};
++		char seq[16];
++		snprintf(seq, sizeof(seq), "%06u", ++stream->split_seq);
++		dstr_copy(&seq_name, filename);
++		dstr_replace(&seq_name, "{seq}", seq);
++		bfree(filename);
++		filename = bstrdup(seq_name.array);
++		dstr_free(&seq_name);
++	}
++
+ 	dstr_copy(dst, dir);
+ 	dstr_replace(dst, "\\", "/");
+ 	if (dstr_end(dst) != '/')
+diff --git a/plugins/obs-ffmpeg/obs-ffmpeg-mux.h b/plugins/obs-ffmpeg/obs-ffmpeg-mux.h
+index 077031d..998d2fa 100644
+--- a/plugins/obs-ffmpeg/obs-ffmpeg-mux.h
++++ b/plugins/obs-ffmpeg/obs-ffmpeg-mux.h
+@@ -44,6 +44,8 @@ struct ffmpeg_muxer {
+ 	int64_t video_pts_offset;
+ 	int64_t audio_dts_offsets[MAX_AUDIO_MIXES];
+ 	bool split_file_ready;
++	/* DPM: counter behind the {seq} token of split file names */
++	uint32_t split_seq;
+ 	volatile bool manual_split;
+ 
+ 	/* these are accessed both by replay buffer and by HLS */
 diff --git a/plugins/win-capture/game-capture-file-init.c b/plugins/win-capture/game-capture-file-init.c
 index dc4f3c2..9e2cd8b 100644
 --- a/plugins/win-capture/game-capture-file-init.c
