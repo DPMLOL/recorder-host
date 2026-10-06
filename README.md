@@ -12,7 +12,12 @@ Needs Visual Studio 2026 (C++ workload, Windows SDK 10.0.26100), git and node.
 ```
 scripts\build.cmd            # build\obs-install\bin\64bit\recorder-host.exe
 scripts\build.cmd --sign     # + signs graphics-hook, inject-helper, get-graphics-offsets and the host (DPM_SIGN_KEYPAIR)
+scripts\build.cmd --sign --copy   # + assembles build\dist (what DPM ships) and copies it to DPM_APP_RECORDER_HOST_DIR
 ```
+
+Clone with `git clone --recursive`, or let the script fetch the submodule. Signing is optional and needs your own
+certificate: `--sign` calls DigiCert's `smctl` with the keypair alias in `DPM_SIGN_KEYPAIR`. An unsigned build records
+the desktop fine, but Vanguard refuses an unsigned graphics hook, so game capture needs a signed one.
 
 The script initialises `obs-studio/` (submodule pinned to 32.2.2), applies `patches/`, builds OBS without
 frontend/browser/websocket/scripting, builds the host, then copies the obs-deps DLLs the binaries really import.
