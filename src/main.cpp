@@ -77,6 +77,9 @@ void chdir_to_exe() {
 
 int main() {
   SetErrorMode(SEM_FAILCRITICALERRORS);
+  // Desktop Duplication (DuplicateOutput1, the DXGI monitor capture) fails with DXGI_ERROR_UNSUPPORTED in a
+  // process that is not per-monitor DPI aware; the OBS frontend gets this from Qt.
+  SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   _setmode(_fileno(stdout), _O_BINARY);
   _setmode(_fileno(stdin), _O_BINARY);
   chdir_to_exe();
