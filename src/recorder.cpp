@@ -4,6 +4,7 @@
 #include "protocol.h"
 #include "wall_clock.h"
 
+#include <util/platform.h>
 #include <util/windows/window-helpers.h>
 
 #include <algorithm>
@@ -18,8 +19,12 @@ constexpr char kLeagueWindow[] = "League of Legends (TM) Client:RiotWindowClass:
 constexpr uint32_t kDefaultWidth = 1920;
 constexpr uint32_t kDefaultHeight = 1080;
 constexpr uint32_t kDefaultFps = 60;
+constexpr long long kDefaultKeyframeSec = 2;
 constexpr long long kKeyframesPerAnchorCheck = 30;
 constexpr auto kStopTimeout = std::chrono::seconds(30);
+// Closing stdin: the parent is gone, so the vod is finalised quickly or not at all.
+constexpr auto kShutdownStopTimeout = std::chrono::seconds(5);
+constexpr long long kProtocol = 2;
 
 // Outputs signal their stop from their own threads; stop() waits for all of them here.
 std::mutex stop_mutex;
@@ -104,10 +109,10 @@ bool Recorder::init() {
 }
 
 void Recorder::shutdown() {
-  for (OutputSlot *slot : {&segments_, &vod_}) {
-    if (slot->output && obs_output_active(slot->output)) {
-      obs_output_force_stop(slot->output);
-    }
+  // A normal stop, as `stop` does, waited for: a forced one finalises the vod only if a packet still arrives
+  // before the teardown below, and loses what libobs had buffered.
+  if (recording()) {
+    stop_outputs(kShutdownStopTimeout);
   }
   release_session();
   audio_.release();
@@ -143,6 +148,7 @@ void Recorder::info(long long id) {
   OBSDataAutoRelease event = obs_data_create();
   obs_data_set_string(event, "event", "info");
   obs_data_set_int(event, "id", id);
+  obs_data_set_int(event, "protocol", kProtocol);
   obs_data_set_string(event, "obsVersion", obs_get_version_string());
   append_devices(event, "inputs", "wasapi_input_capture");
   append_devices(event, "outputs", "wasapi_output_capture");
@@ -161,7 +167,7 @@ void Recorder::info(long long id) {
   obs_data_set_array(event, "encoders", encoders);
   obs_data_set_string(event, "defaultEncoder", pick_video_encoder(nullptr));
 
-  protocol::send(event);
+  protocol::send(event, "features", {"vod-only", "progress", "encoder-settings"});
 }
 
 bool Recorder::reset_video(uint32_t width, uint32_t height, uint32_t fps) {
@@ -252,6 +258,8 @@ bool Recorder::start_output(OutputSlot &slot, const char *type, obs_data_t *sett
   }
   slot.start_signal.Connect(obs_output_get_signal_handler(slot.output), "start", on_output_start, &slot);
   slot.stop_signal.Connect(obs_output_get_signal_handler(slot.output), "stop", on_output_stop, &slot);
+  // Before the start, so the first keyframe is never missed.
+  obs_output_add_packet_callback(slot.output, on_packet, &slot);
   {
     std::lock_guard lock(stop_mutex);
     slot.running = true;
@@ -273,33 +281,38 @@ void Recorder::start(long long id, obs_data_t *params) {
   }
   release_session();
 
-  // The ring: fixed-length MPEG-TS segments named {prefix}_{000000}.ts, which clips are cut from.
+  // The ring (fixed-length MPEG-TS segments named {prefix}_{000000}.ts, which clips are cut from), the vod, or
+  // both. The vod is the replay, written as the game plays: Hybrid MP4 stays readable if anything crashes, and
+  // needs no remux at the end.
   OBSDataAutoRelease out = obs_data_get_obj(params, "output");
   OBSDataAutoRelease segments = out ? obs_data_get_obj(out, "segments") : nullptr;
-  if (!segments) {
-    protocol::send_error("start", id, "missing output.segments");
+  vod_path_ = out ? obs_data_get_string(out, "vod") : "";
+  if (!segments && vod_path_.empty()) {
+    protocol::send_error("start", id, "nothing to record");
     return;
   }
-  const std::string directory = obs_data_get_string(segments, "directory");
-  const std::string prefix = obs_data_get_string(segments, "prefix");
-  const uint32_t segment_seconds = (uint32_t)obs_data_get_int(segments, "seconds");
-  if (directory.empty() || prefix.empty() || segment_seconds == 0) {
-    protocol::send_error("start", id, "segments needs directory, prefix and seconds");
-    return;
+  std::string first_segment;
+  uint32_t segment_seconds = 0;
+  OBSDataAutoRelease segment_settings;
+  if (segments) {
+    const std::string directory = obs_data_get_string(segments, "directory");
+    const std::string prefix = obs_data_get_string(segments, "prefix");
+    segment_seconds = (uint32_t)obs_data_get_int(segments, "seconds");
+    if (directory.empty() || prefix.empty() || segment_seconds == 0) {
+      protocol::send_error("start", id, "segments needs directory, prefix and seconds");
+      return;
+    }
+    first_segment = directory + "/" + prefix + "_000000.ts";
+    segment_settings = obs_data_create();
+    obs_data_set_string(segment_settings, "path", first_segment.c_str());
+    obs_data_set_bool(segment_settings, "split_file", true);
+    obs_data_set_int(segment_settings, "max_time_sec", segment_seconds);
+    obs_data_set_int(segment_settings, "max_size_mb", 0);
+    obs_data_set_bool(segment_settings, "allow_overwrite", true);
+    obs_data_set_string(segment_settings, "directory", directory.c_str());
+    obs_data_set_string(segment_settings, "format", (prefix + "_{seq}").c_str());
+    obs_data_set_string(segment_settings, "extension", "ts");
   }
-  const std::string first_segment = directory + "/" + prefix + "_000000.ts";
-  OBSDataAutoRelease segment_settings = obs_data_create();
-  obs_data_set_string(segment_settings, "path", first_segment.c_str());
-  obs_data_set_bool(segment_settings, "split_file", true);
-  obs_data_set_int(segment_settings, "max_time_sec", segment_seconds);
-  obs_data_set_int(segment_settings, "max_size_mb", 0);
-  obs_data_set_bool(segment_settings, "allow_overwrite", true);
-  obs_data_set_string(segment_settings, "directory", directory.c_str());
-  obs_data_set_string(segment_settings, "format", (prefix + "_{seq}").c_str());
-  obs_data_set_string(segment_settings, "extension", "ts");
-  // The replay, written as the game plays: Hybrid MP4 stays readable if anything crashes, and needs
-  // no remux at the end.
-  vod_path_ = obs_data_get_string(out, "vod");
 
   OBSDataAutoRelease video = obs_data_get_obj(params, "video");
   if (!video) {
@@ -309,6 +322,13 @@ void Recorder::start(long long id, obs_data_t *params) {
   obs_data_set_default_int(video, "height", kDefaultHeight);
   obs_data_set_default_int(video, "fps", kDefaultFps);
   obs_data_set_default_int(video, "bitrateKbps", 20000);
+  obs_data_set_default_int(video, "keyframeSec", kDefaultKeyframeSec);
+  // Segments split on keyframes, so with a ring the GOP is the segment length.
+  const long long keyframe_sec = segments ? segment_seconds : obs_data_get_int(video, "keyframeSec");
+  if (keyframe_sec <= 0) {
+    protocol::send_error("start", id, "video.keyframeSec must be positive");
+    return;
+  }
 
   if (!reset_video((uint32_t)obs_data_get_int(video, "width"), (uint32_t)obs_data_get_int(video, "height"),
                    (uint32_t)obs_data_get_int(video, "fps"))) {
@@ -348,8 +368,12 @@ void Recorder::start(long long id, obs_data_t *params) {
   OBSDataAutoRelease encoder_settings = obs_data_create();
   obs_data_set_string(encoder_settings, "rate_control", "CBR");
   obs_data_set_int(encoder_settings, "bitrate", obs_data_get_int(video, "bitrateKbps"));
-  // Segments split on keyframes, so the GOP is the segment length.
-  obs_data_set_int(encoder_settings, "keyint_sec", segment_seconds);
+  obs_data_set_int(encoder_settings, "keyint_sec", keyframe_sec);
+  // Preset and rate control, translated per encoder by DPM: applied as given, over the three above.
+  OBSDataAutoRelease extra_settings = obs_data_get_obj(video, "encoderSettings");
+  if (extra_settings) {
+    obs_data_apply(encoder_settings, extra_settings);
+  }
   video_encoder_ = obs_video_encoder_create(encoder_id, "video", encoder_settings, nullptr);
   if (!video_encoder_) {
     protocol::send_error("start", id, std::string("video encoder creation failed: ") + encoder_id);
@@ -364,31 +388,49 @@ void Recorder::start(long long id, obs_data_t *params) {
     anchored_ = false;
     last_keyframe_wall_ms_ = 0;
     last_video_wall_ms_ = 0;
-    segment_file_ = base_name(first_segment);
+    stop_ns_ = 0;
+    file_start_wall_ms_ = 0;
+    first_dts_sec_ = 0;
+    last_dts_sec_ = 0;
+    segment_file_ = segments ? base_name(first_segment) : "";
     segment_start_wall_ms_ = 0;
+    // Anchors map the file the app plays: the vod's own time when there is one.
+    clock_ = vod_path_.empty() ? &segments_ : &vod_;
   }
   audio_.start_loudness();
 
-  if (!start_output(segments_, "ffmpeg_muxer", segment_settings, error)) {
-    protocol::send_error("start", id, error);
-    release_session();
-    return;
+  if (segments) {
+    if (!start_output(segments_, "ffmpeg_muxer", segment_settings, error)) {
+      protocol::send_error("start", id, error);
+      release_session();
+      return;
+    }
+    file_changed_.Connect(obs_output_get_signal_handler(segments_.output), "file_changed", on_file_changed, this);
   }
-  file_changed_.Connect(obs_output_get_signal_handler(segments_.output), "file_changed", on_file_changed, this);
-  obs_output_add_packet_callback(segments_.output, on_packet, this);
 
   if (!vod_path_.empty()) {
     OBSDataAutoRelease vod_settings = obs_data_create();
     obs_data_set_string(vod_settings, "path", vod_path_.c_str());
     if (!start_output(vod_, "mp4_output", vod_settings, error)) {
+      if (!segments) {
+        // Nothing else would record.
+        protocol::send_error("start", id, error);
+        release_session();
+        return;
+      }
       // The ring still records: clips work, and DPM can assemble the replay from it.
       blog(LOG_WARNING, "%s", error.c_str());
       OBSDataAutoRelease warning = obs_data_create();
       obs_data_set_string(warning, "event", "warning");
       obs_data_set_string(warning, "message", error.c_str());
       protocol::send(warning);
+      // Disconnected before the output is released, while its signal handler still exists.
+      vod_.start_signal.Disconnect();
+      vod_.stop_signal.Disconnect();
       vod_.output = nullptr;
       vod_path_.clear();
+      std::lock_guard lock(clock_mutex_);
+      clock_ = &segments_;
     }
   }
 
@@ -418,6 +460,36 @@ void Recorder::stop(long long id) {
     return;
   }
 
+  stop_outputs(kStopTimeout);
+
+  OBSDataAutoRelease event = obs_data_create();
+  obs_data_set_string(event, "event", "stopped");
+  obs_data_set_int(event, "id", id);
+  obs_data_set_string(event, "vod", vod_path_.c_str());
+  {
+    std::lock_guard lock(clock_mutex_);
+    if (clock_ == &vod_ && anchored_) {
+      // mp4_output never writes a track's last packet (its duration is the gap to the next one), so the vod's
+      // video lasts the decode times it spans, from file time 0.
+      obs_data_set_double(event, "endWallMs", file_start_wall_ms_ + (last_dts_sec_ - first_dts_sec_) * 1000);
+    } else if (last_video_wall_ms_ > 0) {
+      // The ring writes every packet: it ends one frame after its last picture.
+      obs_data_set_double(event, "endWallMs", last_video_wall_ms_ + (fps_ ? 1000.0 / fps_ : 0));
+    }
+  }
+  // The whole recording's mix, measured as it played: the replay's normalisation gain needs no second pass.
+  set_db(event, "loudnessLufs", audio_.loudness_lufs(0));
+  set_db(event, "peakDb", audio_.peak_dbfs(0));
+  release_session();
+  protocol::send(event);
+}
+
+void Recorder::stop_outputs(std::chrono::seconds timeout) {
+  {
+    // Taken just before obs_output_stop takes its own, so a packet is never counted that the file does not hold.
+    std::lock_guard lock(clock_mutex_);
+    stop_ns_ = os_gettime_ns();
+  }
   for (OutputSlot *slot : {&segments_, &vod_}) {
     if (slot->output && slot->running) {
       obs_output_stop(slot->output);
@@ -425,27 +497,15 @@ void Recorder::stop(long long id) {
   }
   // Muxers flush asynchronously; sources are only released once every file is closed.
   std::unique_lock lock(stop_mutex);
-  if (!stop_cv.wait_for(lock, kStopTimeout, [this] { return !recording(); })) {
+  if (!stop_cv.wait_for(lock, timeout, [this] { return !recording(); })) {
     lock.unlock();
-    blog(LOG_WARNING, "outputs did not stop within 30 s, forcing");
+    blog(LOG_WARNING, "outputs did not stop within %lld s, forcing", (long long)timeout.count());
     for (OutputSlot *slot : {&segments_, &vod_}) {
       if (slot->output && obs_output_active(slot->output)) {
         obs_output_force_stop(slot->output);
       }
     }
-  } else {
-    lock.unlock();
   }
-
-  OBSDataAutoRelease event = obs_data_create();
-  obs_data_set_string(event, "event", "stopped");
-  obs_data_set_int(event, "id", id);
-  obs_data_set_string(event, "vod", vod_path_.c_str());
-  // The whole recording's mix, measured as it played: the replay's normalisation gain needs no second pass.
-  set_db(event, "loudnessLufs", audio_.loudness_lufs(0));
-  set_db(event, "peakDb", audio_.peak_dbfs(0));
-  release_session();
-  protocol::send(event);
 }
 
 // The mixer's live view outside a game: the same sources as a recording, with meters, and nothing written.
@@ -502,10 +562,10 @@ void Recorder::release_session() {
   file_changed_.Disconnect();
   hooked_.Disconnect();
   unhooked_.Disconnect();
-  if (segments_.output) {
-    obs_output_remove_packet_callback(segments_.output, on_packet, this);
-  }
   for (OutputSlot *slot : {&segments_, &vod_}) {
+    if (slot->output) {
+      obs_output_remove_packet_callback(slot->output, on_packet, slot);
+    }
     slot->start_signal.Disconnect();
     slot->stop_signal.Disconnect();
     slot->output = nullptr;
@@ -531,9 +591,11 @@ void Recorder::close_segment(double end_wall_ms) {
   protocol::send(event);
 }
 
-// Runs on the output thread. Maps file time to wall clock so DPM can place game events on the video.
+// Runs on the output's thread, for every output. Maps file time to wall clock so DPM can place game events on
+// the video, and tells how far the file reaches.
 void Recorder::on_packet(obs_output_t *, encoder_packet *pkt, encoder_packet_time *pkt_time, void *param) {
-  auto *self = static_cast<Recorder *>(param);
+  auto *slot = static_cast<OutputSlot *>(param);
+  Recorder *self = slot->owner;
   if (pkt->type != OBS_ENCODER_VIDEO) {
     return;
   }
@@ -542,16 +604,40 @@ void Recorder::on_packet(obs_output_t *, encoder_packet *pkt, encoder_packet_tim
       pkt_time ? obs_ns_to_wall_ms(pkt_time->cts) : obs_ns_to_wall_ms((uint64_t)pkt->sys_dts_usec * 1000);
 
   std::lock_guard lock(self->clock_mutex_);
+  // The packet that ends the file still comes through here; with B-frames it shows after the last written picture.
+  if (self->stop_ns_ && (uint64_t)pkt->sys_dts_usec * 1000 >= self->stop_ns_) {
+    return;
+  }
   self->last_video_wall_ms_ = std::max(self->last_video_wall_ms_, wall_ms);
+  if (slot == self->clock_) {
+    // An output's first packet is a keyframe, which anchors it.
+    const double dts_sec = (double)pkt->dts * pkt->timebase_num / pkt->timebase_den;
+    if (!self->anchored_) {
+      self->first_dts_sec_ = dts_sec;
+    }
+    self->last_dts_sec_ = dts_sec;
+  }
   if (!pkt->keyframe) {
     return;
   }
-  self->last_keyframe_wall_ms_ = wall_ms;
-  if (self->segment_start_wall_ms_ == 0) {
-    self->segment_start_wall_ms_ = wall_ms;
+  if (slot == &self->segments_) {
+    self->last_keyframe_wall_ms_ = wall_ms;
+    if (self->segment_start_wall_ms_ == 0) {
+      self->segment_start_wall_ms_ = wall_ms;
+    }
+  }
+  if (slot != self->clock_) {
+    return;
   }
 
   const bool first = !self->anchored_;
+  if (!first) {
+    // A keyframe closes the previous GOP: every picture before it is with the muxer, a whole fragment of the vod.
+    OBSDataAutoRelease progress = obs_data_create();
+    obs_data_set_string(progress, "event", "progress");
+    obs_data_set_double(progress, "endWallMs", wall_ms);
+    protocol::send(progress);
+  }
   if (!first && ++self->keyframes_ % kKeyframesPerAnchorCheck != 0) {
     return;
   }
@@ -562,7 +648,11 @@ void Recorder::on_packet(obs_output_t *, encoder_packet *pkt, encoder_packet_tim
   obs_data_set_string(event, "kind", first ? "first" : "check");
   obs_data_set_int(event, "pts", pkt->pts);
   obs_data_set_int(event, "dts", pkt->dts);
-  obs_data_set_double(event, "ptsSec", (double)pkt->pts * pkt->timebase_num / pkt->timebase_den);
+  const double pts_sec = (double)pkt->pts * pkt->timebase_num / pkt->timebase_den;
+  if (first) {
+    self->file_start_wall_ms_ = wall_ms - pts_sec * 1000;
+  }
+  obs_data_set_double(event, "ptsSec", pts_sec);
   obs_data_set_double(event, "dtsWallMs", obs_ns_to_wall_ms((uint64_t)pkt->sys_dts_usec * 1000));
   obs_data_set_double(event, "wallMs", wall_ms);
   protocol::send(event);
@@ -578,10 +668,11 @@ void Recorder::on_file_changed(void *param, calldata_t *cd) {
   self->segment_start_wall_ms_ = self->last_keyframe_wall_ms_;
 }
 
-// The ring writing means the recording is live; the replay output follows the same encoders.
+// The first output writing means the recording is live: the ring when there is one (started first), else the vod.
 void Recorder::on_output_start(void *param, calldata_t *) {
   auto *slot = static_cast<OutputSlot *>(param);
-  if (slot == &slot->owner->segments_) {
+  Recorder *self = slot->owner;
+  if (slot == (self->segments_.output ? &self->segments_ : &self->vod_)) {
     protocol::send_event("started");
   }
 }

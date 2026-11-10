@@ -28,23 +28,32 @@ frontend/browser/websocket/scripting, builds the host, then copies the obs-deps 
 ## Protocol
 
 One JSON object per line. stdout carries only protocol lines; libobs logs go to stderr
-(`RECORDER_HOST_DEBUG=1` adds debug logs). Closing stdin shuts the host down.
+(`RECORDER_HOST_DEBUG=1` adds debug logs). Closing stdin stops the outputs as `stop` does (5 s limit, then forced, no
+`stopped` reply) so the vod is finalised, then shuts the host down. `shutdown` does the same.
 
 Commands (`id` is echoed back on replies and errors):
 
 | cmd | params | reply |
 |---|---|---|
-| `info` | – | `info {obsVersion, inputs, outputs, encoders, defaultEncoder}` (inputs/outputs = Windows endpoint ids + names) |
+| `info` | – | `info {protocol, obsVersion, inputs, outputs, encoders, defaultEncoder, features}` (inputs/outputs = Windows endpoint ids + names) |
 | `audio_apps` | – | `audio_apps {apps: [{executable, pid, active}]}`: apps with an audio session on any output |
 | `monitor` | `audio` | `monitoring`: opens the tracks with meters, writes nothing (the settings mixer) |
-| `start` | `output: {segments: {directory, prefix, seconds}, vod?}`, `video`, `audio` | `starting {encoder, path, vod, width, height, fps, tracks}` |
+| `start` | `output: {segments?: {directory, prefix, seconds}, vod?}` (one or both), `video`, `audio` | `starting {encoder, path, vod, width, height, fps, tracks}` (`path` is the first segment, empty without segments) |
 | `set_volume` | `track`, `volume` (0–2) | `ok` |
 | `loudness` | `sinceWallMs` | `loudness {loudnessLufs?, peakDb?}` of the mix since then |
-| `stop` | – | `stopped {vod, loudnessLufs?, peakDb?}` once every output is closed |
+| `stop` | – | `stopped {vod, endWallMs?, loudnessLufs?, peakDb?}` once every output is closed |
 | `shutdown` | – | – |
 
-`video: {source: "game" | "monitor", window?, width?, height?, fps?, bitrateKbps?, encoder?}`; `window` uses OBS's
-`title:class:exe` form and defaults to League's game window.
+`info.protocol` is `2`. `info.features` lists what this host supports: `"vod-only"`, `"progress"`, `"encoder-settings"`.
+
+`output` needs `segments`, `vod` or both; with neither, `start` fails with `nothing to record`. The app runs one at a time
+(the vod in a game, the ring for a replay buffer); both together still work.
+
+`video: {source: "game" | "monitor", window?, width?, height?, fps?, bitrateKbps?, encoder?, keyframeSec?, encoderSettings?}`;
+`window` uses OBS's `title:class:exe` form and defaults to League's game window. `keyframeSec` (default 2) is the keyframe
+interval without segments; with segments it is `segments.seconds`. `encoderSettings` is an object of libobs encoder
+settings applied as given over the host's own `rate_control: "CBR"`, `bitrate` and `keyint_sec` (e.g. `{preset: "p5"}` for
+NVENC, `{rate_control: "CRF", crf: 20}` for x264). The host does not interpret them; an encoder that refuses them fails `start`.
 
 `audio: [{id, kind: "process", executable | window} | {id, kind: "input", deviceId}, volume?, mono?]`, 5 at most.
 A process track captures the app's process tree wherever it plays (WASAPI process loopback). Inputs are downmixed to mono
@@ -58,16 +67,26 @@ sends `segment {file, startWallMs, endWallMs}` as each one closes, like a line o
 segment can be longer than `seconds`.
 
 `vod` is a path for a Hybrid MP4 written as the game plays: readable even after a crash, and complete the moment `stop`
-returns — no remux. If it cannot start, a `warning` is sent and the ring still records.
+returns: no remux. If it cannot start, `start` fails; with segments, a `warning` is sent instead and the ring still records.
 
-Other events: `ready`, `started`, `hooked {title, class, executable}`, `unhooked`, `levels {levels: {trackId: peakDb}}`
-(4x/s while tracks are open), `output_stopped {output, code, error?}` (a non-zero code outside `stop` means the output
-died), `anchor`, `warning {message}`, `error {cmd, id, message}`.
+Events:
+
+| event | fields | sent |
+|---|---|---|
+| `progress` | `endWallMs` | On every video keyframe after the first (every `keyframeSec`), on the vod when there is one, else on the ring. All video before `endWallMs` has been handed to the muxer as a complete fragment: how far the file reaches if the host dies, and the host's heartbeat while recording. |
+| `stopped` | `endWallMs?` | Wall clock of the end of the video. For the vod: file time 0 plus the vod's video duration (`mp4_output` never writes a track's last packet). For the ring: one frame after its last picture. Absent if no video was written. |
+
+Other events: `ready`, `started` (the first output is writing: the ring when there is one, else the vod), `hooked {title,
+class, executable}`, `unhooked`, `levels {levels: {trackId: peakDb}}` (4x/s while tracks are open), `output_stopped
+{output, code, error?}` (a non-zero code outside `stop` means the output died), `anchor`, `segment`, `warning {message}`,
+`error {cmd, id, message}`.
 
 ### Anchor
 
 `anchor {kind: "first" | "check", ptsSec, wallMs, dtsWallMs}` maps file time to wall clock (Unix ms):
-`wall(t) = wallMs + (t - ptsSec) * 1000`. It is sent on the first video keyframe, then every 30 keyframes (~60 s) as a drift check.
+`wall(t) = wallMs + (t - ptsSec) * 1000`. It is sent on the first video keyframe, then every 30 keyframes (~60 s at the
+default 2 s interval) as a drift check. It is measured on the vod's own packets when there is a vod, else on the ring's,
+so `t` is the vod's file time: the first anchor has `ptsSec` 0 and gives where the vod starts on the wall clock.
 `wallMs` is the frame's composition time (`os_gettime_ns`, QPC) converted with a clock pair sampled at conversion time.
 
 Measured 2026-09-28: 6 screen flashes at logged times land +20 to +36 ms late (1–2 frames of display/capture latency), and
