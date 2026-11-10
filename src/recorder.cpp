@@ -112,6 +112,7 @@ void Recorder::shutdown() {
   // A normal stop, as `stop` does, waited for: a forced one finalises the vod only if a packet still arrives
   // before the teardown below, and loses what libobs had buffered.
   if (recording()) {
+    preview_.stop();
     stop_outputs(kShutdownStopTimeout);
   }
   release_session();
@@ -139,6 +140,8 @@ void Recorder::handle(obs_data_t *command) {
     loudness(id, command);
   } else if (strcmp(cmd, "audio_apps") == 0) {
     audio_apps(id);
+  } else if (strcmp(cmd, "thumbnail") == 0) {
+    thumbnail(id, command);
   } else {
     protocol::send_error(cmd, id, "unknown command");
   }
@@ -167,7 +170,7 @@ void Recorder::info(long long id) {
   obs_data_set_array(event, "encoders", encoders);
   obs_data_set_string(event, "defaultEncoder", pick_video_encoder(nullptr));
 
-  protocol::send(event, "features", {"vod-only", "progress", "encoder-settings"});
+  protocol::send(event, "features", {"vod-only", "progress", "encoder-settings", "preview", "thumbnail"});
 }
 
 bool Recorder::reset_video(uint32_t width, uint32_t height, uint32_t fps) {
@@ -293,6 +296,18 @@ void Recorder::start(long long id, obs_data_t *params) {
   if (!segments && vod_path_.empty()) {
     protocol::send_error("start", id, "nothing to record");
     return;
+  }
+  PreviewSettings preview;
+  ThumbnailSettings thumbnail;
+  bool with_preview = false;
+  bool with_thumbnail = false;
+  {
+    std::string error;
+    if (!Preview::parse_preview(params, preview, with_preview, error) ||
+        !Preview::parse_thumbnail(params, thumbnail, with_thumbnail, error)) {
+      protocol::send_error("start", id, error);
+      return;
+    }
   }
   std::string first_segment;
   uint32_t segment_seconds = 0;
@@ -437,6 +452,14 @@ void Recorder::start(long long id, obs_data_t *params) {
     }
   }
 
+  // Started with every recording, so the `thumbnail` command works without start.thumbnail. Tile 0 is the next
+  // composited frame.
+  preview_.start(width_, height_, with_preview ? &preview : nullptr, with_thumbnail ? &thumbnail : nullptr);
+  if (strcmp(obs_source_get_id(video_source_), "game_capture") != 0) {
+    // The monitor shows from its first frame; a game from its hook (on_hooked).
+    preview_.auto_thumbnail();
+  }
+
   OBSDataAutoRelease event = obs_data_create();
   obs_data_set_string(event, "event", "starting");
   obs_data_set_int(event, "id", id);
@@ -446,6 +469,8 @@ void Recorder::start(long long id, obs_data_t *params) {
   obs_data_set_int(event, "width", width_);
   obs_data_set_int(event, "height", height_);
   obs_data_set_int(event, "fps", fps_);
+  obs_data_set_bool(event, "preview", preview_.preview_active());
+  obs_data_set_bool(event, "thumbnail", preview_.thumbnail_active());
   OBSDataArrayAutoRelease ids = obs_data_array_create();
   for (const std::string &track : audio_.track_ids()) {
     OBSDataAutoRelease entry = obs_data_create();
@@ -463,12 +488,18 @@ void Recorder::stop(long long id) {
     return;
   }
 
+  // First, so the last tile is older than the end of the video; the last sheet is written before `stopped`.
+  const bool with_preview = preview_.preview_active();
+  preview_.stop();
   stop_outputs(kStopTimeout);
 
   OBSDataAutoRelease event = obs_data_create();
   obs_data_set_string(event, "event", "stopped");
   obs_data_set_int(event, "id", id);
   obs_data_set_string(event, "vod", vod_path_.c_str());
+  if (with_preview) {
+    obs_data_set_int(event, "tiles", preview_.tiles());
+  }
   {
     std::lock_guard lock(clock_mutex_);
     if (clock_ == &vod_ && anchored_) {
@@ -551,6 +582,16 @@ void Recorder::loudness(long long id, obs_data_t *params) {
   protocol::send(event);
 }
 
+// A Thumbnail now (the game clock passed 1:30, a first kill): replied to once the file is written.
+void Recorder::thumbnail(long long id, obs_data_t *params) {
+  std::string error;
+  if (!recording() || !preview_.running()) {
+    protocol::send_error("thumbnail", id, "not recording");
+  } else if (!preview_.thumbnail(id, params, error)) {
+    protocol::send_error("thumbnail", id, error);
+  }
+}
+
 void Recorder::audio_apps(long long id) {
   OBSDataArrayAutoRelease apps = obs_data_array_create();
   list_audio_apps(apps);
@@ -562,6 +603,7 @@ void Recorder::audio_apps(long long id) {
 }
 
 void Recorder::release_session() {
+  preview_.stop();
   file_changed_.Disconnect();
   hooked_.Disconnect();
   unhooked_.Disconnect();
@@ -706,13 +748,15 @@ void Recorder::on_output_stop(void *param, calldata_t *cd) {
   stop_cv.notify_all();
 }
 
-void Recorder::on_hooked(void *, calldata_t *cd) {
+void Recorder::on_hooked(void *param, calldata_t *cd) {
   OBSDataAutoRelease event = obs_data_create();
   obs_data_set_string(event, "event", "hooked");
   obs_data_set_string(event, "title", calldata_string(cd, "title"));
   obs_data_set_string(event, "class", calldata_string(cd, "class"));
   obs_data_set_string(event, "executable", calldata_string(cd, "executable"));
   protocol::send(event);
+  // The first frame of the game: a Game recording has its Thumbnail from its first seconds (once per Run).
+  static_cast<Recorder *>(param)->preview_.auto_thumbnail();
 }
 
 void Recorder::on_unhooked(void *, calldata_t *) {

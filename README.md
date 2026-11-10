@@ -38,13 +38,15 @@ Commands (`id` is echoed back on replies and errors):
 | `info` | – | `info {protocol, obsVersion, inputs, outputs, encoders, defaultEncoder, features}` (inputs/outputs = Windows endpoint ids + names) |
 | `audio_apps` | – | `audio_apps {apps: [{executable, pid, active}]}`: apps with an audio session on any output |
 | `monitor` | `audio` | `monitoring`: opens the tracks with meters, writes nothing (the settings mixer) |
-| `start` | `output: {segments?: {directory, prefix, seconds}, vod?}` (one or both), `video`, `audio` | `starting {encoder, path, vod, width, height, fps, tracks}` (`path` is the first segment, empty without segments) |
+| `start` | `output: {segments?: {directory, prefix, seconds}, vod?}` (one or both), `video`, `audio`, `preview?`, `thumbnail?` | `starting {encoder, path, vod, width, height, fps, preview, thumbnail, tracks}` (`path` is the first segment, empty without segments; `preview` and `thumbnail` tell whether each is on) |
 | `set_volume` | `track`, `volume` (0–2) | `ok` |
 | `loudness` | `sinceWallMs` | `loudness {loudnessLufs?, peakDb?}` of the mix since then |
-| `stop` | – | `stopped {vod, endWallMs?, loudnessLufs?, peakDb?}` once every output is closed |
+| `thumbnail` | `path?`, `width?`, `height?` (default: those of `start.thumbnail`, else 480x270) | `thumbnail {path, wallMs}` once the file is written; `error` "not recording" outside a recording |
+| `stop` | – | `stopped {vod, endWallMs?, tiles?, loudnessLufs?, peakDb?}` once every output is closed (`tiles` with `preview`) |
 | `shutdown` | – | – |
 
-`info.protocol` is `2`. `info.features` lists what this host supports: `"vod-only"`, `"progress"`, `"encoder-settings"`.
+`info.protocol` is `2`. `info.features` lists what this host supports: `"vod-only"`, `"progress"`, `"encoder-settings"`,
+`"preview"`, `"thumbnail"`.
 
 `output` needs `segments`, `vod` or both; with neither, `start` fails with `nothing to record`. The app runs one at a time
 (the vod in a game, the ring for a replay buffer); both together still work.
@@ -75,11 +77,44 @@ Events:
 |---|---|---|
 | `progress` | `endWallMs` | On every video keyframe after the first (every `keyframeSec`), on the vod when there is one, else on the ring. All video before `endWallMs` has been handed to the muxer as a complete fragment: how far the file reaches if the host dies, and the host's heartbeat while recording. |
 | `stopped` | `endWallMs?` | Wall clock of the end of the video. For the vod: file time 0 plus the vod's video duration (`mp4_output` never writes a track's last packet). For the ring: one frame after its last picture. Absent if no video was written. |
+| `preview` | `file, sheet, tiles, firstWallMs, intervalMs` | Each time a Sprite sheet is written (see below). |
+| `thumbnail` | `path, wallMs` | The automatic Thumbnail of `start.thumbnail` was written (no `id`). |
 
 Other events: `ready`, `started` (the first output is writing: the ring when there is one, else the vod), `hooked {title,
 class, executable}`, `unhooked`, `levels {levels: {trackId: peakDb}}` (4x/s while tracks are open), `output_stopped
 {output, code, error?}` (a non-zero code outside `stop` means the output died), `anchor`, `segment`, `warning {message}`,
 `error {cmd, id, message}`.
+
+### Preview tiles, Sprite sheets, Thumbnail
+
+Every image the app shows of a recording is written while it records, so nothing is decoded afterwards.
+
+`preview: {directory, prefix, tileWidth, tileHeight, intervalMs, columns, rows, flushTiles?}` (`flushTiles` default 5)
+grabs one tile of the composited picture every `intervalMs` and packs the tiles, row by row, into JPEG Sprite sheets
+`{directory}/{prefix}_000000.jpg`, `{prefix}_000001.jpg`, … of `columns` x `rows` tiles; cells not grabbed yet are black.
+A sheet is rewritten every `flushTiles` tiles, when it is full, and once more before `stopped` if tiles were added since,
+and each write sends `preview {file, sheet, tiles, firstWallMs, intervalMs}`: `file` is the sheet's path, `tiles` the
+tiles grabbed since `start`, `firstWallMs` the composition time of tile 0 (the first frame after `start`) on the clock
+of `anchor.wallMs`. Tile `k` is the first frame composited at or after `firstWallMs + k * intervalMs`: the cadence follows
+the composition clock, and after lagged frames one frame fills every cell that was due. `stopped.tiles` is the final
+count. Tiles stop when `stop` arrives, just before the outputs, so the last tile is inside the video.
+
+`thumbnail: {path, width?, height?}` (default 480x270) writes one JPEG at the first frame after `hooked` (the first frame
+for `monitor`) and sends `thumbnail {path, wallMs}`. The `thumbnail` command writes another one (same path and size unless
+given) and replies `thumbnail {id, path, wallMs}`; `wallMs` is the composition time of the frame. If the file cannot be
+written, the command gets an `error {cmd: "thumbnail"}` and the automatic one a `warning`.
+
+Every image goes to `<file>.tmp`, then is renamed over `<file>`, so a reader never sees half a file. A failed write sends a
+`warning` (the sheet is kept and written again at the next flush) and never stops the recording. The image keeps the
+canvas aspect inside the tile or Thumbnail, letterboxed when they differ.
+
+How: from libobs's main-rendered callback, on the graphics thread, the canvas (before the NV12 conversion) is drawn into
+a chain of small render targets, halving it each pass (a 2x2 box filter per bilinear tap, in linear light) then scaling
+to the target, and copied to a staging surface that is mapped one frame later, when the GPU is done with it. JPEG
+encoding (the Windows Imaging Component, part of Windows) and file writes run on a worker thread. Measured 2026-11-10
+on the monitor (3440x1440 into 1920x1080, NVIDIA GPU, NVENC): 0.05 ms of graphics-thread time per grab (0.6 ms for the first,
+which creates the targets), 0.04 ms per readback, 3.2 ms per 1600x900 sheet, 2.6 ms per 480x270 Thumbnail, 33 ms from the
+`thumbnail` command to its reply. A 1600x900 sheet of desktop tiles is about 70 KB.
 
 ### Anchor
 

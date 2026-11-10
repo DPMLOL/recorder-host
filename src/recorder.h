@@ -1,6 +1,7 @@
 #pragma once
 
 #include "audio_tracks.h"
+#include "preview.h"
 
 #include <obs.hpp>
 
@@ -31,6 +32,7 @@ class Recorder {
   void monitor(long long id, obs_data_t *params);
   void set_volume(long long id, obs_data_t *params);
   void loudness(long long id, obs_data_t *params);
+  void thumbnail(long long id, obs_data_t *params);
   void audio_apps(long long id);
   void release_session();
   bool recording() const;
@@ -62,6 +64,8 @@ class Recorder {
   OutputSlot segments_{this, "segments"};
   OutputSlot vod_{this, "vod"};
   std::string vod_path_;
+  // Preview tiles, Sprite sheets and Thumbnails, grabbed on the GPU while recording.
+  Preview preview_;
 
   // Written on the output thread (packets, file changes), read at stop.
   std::mutex clock_mutex_;
