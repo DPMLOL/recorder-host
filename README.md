@@ -35,7 +35,7 @@ Commands (`id` is echoed back on replies and errors):
 
 | cmd | params | reply |
 |---|---|---|
-| `info` | – | `info {protocol, obsVersion, inputs, outputs, encoders, defaultEncoder, features}` (inputs/outputs = Windows endpoint ids + names) |
+| `info` | – | `info {protocol, obsVersion, inputs, outputs, encoders, defaultEncoder, hookSigned, hookReason?, features}` (inputs/outputs = Windows endpoint ids + names) |
 | `audio_apps` | – | `audio_apps {apps: [{executable, pid, active}]}`: apps with an audio session on any output |
 | `monitor` | `audio` | `monitoring`: opens the tracks with meters, writes nothing (the settings mixer) |
 | `start` | `output: {segments?: {directory, prefix, seconds}, vod?}` (one or both), `video`, `audio`, `preview?`, `thumbnail?` | `starting {encoder, path, vod, width, height, fps, preview, thumbnail, tracks}` (`path` is the first segment, empty without segments; `preview` and `thumbnail` tell whether each is on) |
@@ -46,12 +46,21 @@ Commands (`id` is echoed back on replies and errors):
 | `shutdown` | – | – |
 
 `info.protocol` is `2`. `info.features` lists what this host supports: `"vod-only"`, `"progress"`, `"encoder-settings"`,
-`"preview"`, `"thumbnail"`.
+`"preview"`, `"thumbnail"`, and `"game-capture"` only when the hook is signed.
+
+Game capture: at init the host checks the Authenticode signature (WinVerifyTrust, no revocation check, nothing fetched)
+of the files game_capture's compatibility hook uses for a 64-bit game: `inject-helper64.exe` and `graphics-hook64.dll`,
+the ProgramData copy (`dpm-recorder-hook`) when win-capture installed one, else the plugin's own. `hookSigned` is true only
+when every one has a valid signature chaining to a trusted root; otherwise `hookReason` says why (e.g.
+`"inject-helper64.exe is not signed, graphics-hook64.dll is not signed"`), and `start` with a `game` source fails at once
+with `game capture unavailable: {hookReason}`, before creating anything, unless `video.allowUnsignedHook` is true (for
+development, on a game without anti-cheat). Vanguard refuses an unsigned hook, and game_capture retries a refused one every
+second or two for as long as the source lives, which stutters the game. A signed hook is injected as before.
 
 `output` needs `segments`, `vod` or both; with neither, `start` fails with `nothing to record`. The app runs one at a time
 (the vod in a game, the ring for a replay buffer); both together still work.
 
-`video: {source: "game" | "monitor", window?, width?, height?, fps?, bitrateKbps?, encoder?, keyframeSec?, encoderSettings?}`;
+`video: {source: "game" | "monitor", window?, width?, height?, fps?, bitrateKbps?, encoder?, keyframeSec?, encoderSettings?, allowUnsignedHook?}`;
 `window` uses OBS's `title:class:exe` form and defaults to League's game window. `keyframeSec` (default 2) is the keyframe
 interval without segments; with segments it is `segments.seconds`. `encoderSettings` is an object of libobs encoder
 settings applied as given over the host's own `rate_control: "CBR"`, `bitrate` and `keyint_sec` (e.g. `{preset: "p5"}` for

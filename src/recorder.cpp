@@ -105,6 +105,7 @@ bool Recorder::init() {
   obs_load_all_modules();
   obs_log_loaded_modules();
   obs_post_load_modules();
+  hook_ = check_hook_signature();
   return true;
 }
 
@@ -169,8 +170,17 @@ void Recorder::info(long long id) {
   }
   obs_data_set_array(event, "encoders", encoders);
   obs_data_set_string(event, "defaultEncoder", pick_video_encoder(nullptr));
+  obs_data_set_bool(event, "hookSigned", hook_.trusted);
+  if (!hook_.trusted) {
+    obs_data_set_string(event, "hookReason", hook_.reason.c_str());
+  }
 
-  protocol::send(event, "features", {"vod-only", "progress", "encoder-settings", "preview", "thumbnail"});
+  if (hook_.trusted) {
+    protocol::send(event, "features",
+                   {"vod-only", "progress", "encoder-settings", "preview", "thumbnail", "game-capture"});
+  } else {
+    protocol::send(event, "features", {"vod-only", "progress", "encoder-settings", "preview", "thumbnail"});
+  }
 }
 
 bool Recorder::reset_video(uint32_t width, uint32_t height, uint32_t fps) {
@@ -335,6 +345,14 @@ void Recorder::start(long long id, obs_data_t *params) {
   OBSDataAutoRelease video = obs_data_get_obj(params, "video");
   if (!video) {
     video = obs_data_create();
+  }
+  // Vanguard refuses an unsigned hook, and game_capture retries it every second or two for as long as the source
+  // lives, which stutters the game: fail before creating anything. `allowUnsignedHook` is for development, on a
+  // game without anti-cheat.
+  if (strcmp(obs_data_get_string(video, "source"), "monitor") != 0 && !hook_.trusted &&
+      !obs_data_get_bool(video, "allowUnsignedHook")) {
+    protocol::send_error("start", id, "game capture unavailable: " + hook_.reason);
+    return;
   }
   obs_data_set_default_int(video, "width", kDefaultWidth);
   obs_data_set_default_int(video, "height", kDefaultHeight);
