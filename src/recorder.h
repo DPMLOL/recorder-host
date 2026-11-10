@@ -1,6 +1,7 @@
 #pragma once
 
 #include "audio_tracks.h"
+#include "hook_signature.h"
 #include "preview.h"
 
 #include <obs.hpp>
@@ -51,6 +52,9 @@ class Recorder {
   static void on_file_changed(void *param, calldata_t *cd);
   static void on_hooked(void *param, calldata_t *cd);
   static void on_unhooked(void *param, calldata_t *cd);
+
+  // Checked once at init: game capture works only with a signed hook.
+  HookSignature hook_;
 
   uint32_t width_ = 0;
   uint32_t height_ = 0;
