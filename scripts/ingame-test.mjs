@@ -1,9 +1,13 @@
 // In-game spike: records League through game_capture as a vod only (no ring), samples the Live Client API game
-// clock so the anchor can be checked against the HUD timer afterwards, and checks the protocol 2 basics.
+// clock so the anchor can be checked against the HUD timer afterwards, and checks the protocol 2 basics (H1) and the
+// Preview tiles, Sprite sheets and Thumbnails (H2).
 //   node scripts/ingame-test.mjs [--seconds 120] [--mic <deviceId>] [--out <dir>] [--source game|monitor] [--eof]
+//                                [--columns 10] [--rows 10]
 // --source monitor records the screen instead (no game needed, nothing injected). --eof closes stdin instead of
 // sending stop, as a crashed app would: the vod must still be finalised.
-// Ctrl+C stops early. Writes <out>/ingame.mp4 and <out>/session.json. Probes the vod with obs-deps' ffprobe if built.
+// --columns and --rows set the Sprite sheet grid (a small one checks the move to the next sheet in a short run).
+// Ctrl+C stops early. Writes <out>/ingame.mp4, <out>/sheets/sheet_*.jpg, <out>/thumbnail.jpg, <out>/session.json.
+// Probes the vod, the sheets and the Thumbnail with obs-deps' ffprobe if built.
 import { spawn, spawnSync } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import https from 'node:https';
@@ -19,14 +23,30 @@ const source = args.source ?? 'game';
 const eof = 'eof' in args;
 const fps = 60;
 const keyframeSec = 2;
+const preview = {
+  prefix: 'sheet',
+  tileWidth: 160,
+  tileHeight: 90,
+  intervalMs: 2000,
+  columns: Number(args.columns ?? 10),
+  rows: Number(args.rows ?? 10),
+  flushTiles: 5,
+};
+const thumbnailSize = { width: 480, height: 270 };
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = resolve(args.out ?? join(root, 'build', 'ingame'));
 mkdirSync(outDir, { recursive: true });
 const vod = join(outDir, 'ingame.mp4');
 rmSync(vod, { force: true });
+const sheetDir = join(outDir, 'sheets');
+rmSync(sheetDir, { recursive: true, force: true });
+mkdirSync(sheetDir, { recursive: true });
+const thumbnail = join(outDir, 'thumbnail.jpg');
+rmSync(thumbnail, { force: true });
+const slash = (path) => path.replace(/\\/g, '/');
 const host = join(root, 'build', 'obs-install', 'bin', '64bit', 'recorder-host.exe');
 
-const session = { startedAt: Date.now(), events: [], anchors: [], progress: [], clock: [] };
+const session = { startedAt: Date.now(), events: [], anchors: [], progress: [], previews: [], clock: [], sheetSizes: {} };
 const proc = spawn(host, [], { stdio: ['pipe', 'pipe', 'inherit'] });
 const send = (o) => proc.stdin.write(JSON.stringify(o) + '\n');
 let stopping = false;
@@ -42,6 +62,7 @@ createInterface({ input: proc.stdout }).on('line', (line) => {
   ev.receivedAt = Date.now();
   if (ev.event === 'anchor') session.anchors.push(ev);
   else if (ev.event === 'progress') session.progress.push(ev);
+  else if (ev.event === 'preview') session.previews.push(ev);
   else session.events.push(ev);
   if (ev.event !== 'levels') console.log(`[host] ${line}`);
   if (ev.event === 'ready') send({ cmd: 'info', id: 1 });
@@ -49,22 +70,33 @@ createInterface({ input: proc.stdout }).on('line', (line) => {
     send({
       cmd: 'start',
       id: 2,
-      output: { vod: vod.replace(/\\/g, '/') },
+      output: { vod: slash(vod) },
       video: { source, width: 1920, height: 1080, fps, keyframeSec },
+      preview: { directory: slash(sheetDir), ...preview },
+      thumbnail: { path: slash(thumbnail), ...thumbnailSize },
       audio: [
         { id: 'game', kind: 'process', executable: 'League of Legends.exe' },
         ...(args.mic ? [{ id: 'mic', kind: 'input', deviceId: args.mic }] : []),
       ],
     });
     setTimeout(stop, seconds * 1000);
+    // A Thumbnail on command halfway, to the start.thumbnail path, timed from the command to its reply.
+    setTimeout(() => {
+      if (stopping) return;
+      session.thumbnailSentAt = Date.now();
+      send({ cmd: 'thumbnail', id: 4 });
+    }, (seconds * 1000) / 2);
   }
   if (ev.event === 'error' && ev.cmd === 'start') send({ cmd: 'shutdown' });
-  if (ev.event === 'stopped') send({ cmd: 'shutdown' });
+  // Asked once nothing records: must be refused.
+  if (ev.event === 'stopped') send({ cmd: 'thumbnail', id: 5 });
+  if (ev.event === 'error' && ev.cmd === 'thumbnail' && ev.id === 5) send({ cmd: 'shutdown' });
 });
 
 function stop() {
   if (stopping) return;
   stopping = true;
+  session.stopSentAt = Date.now();
   console.log(eof ? '[test] closing stdin' : '[test] stopping');
   if (eof) proc.stdin.end();
   else send({ cmd: 'stop', id: 3 });
@@ -88,6 +120,16 @@ const poll = setInterval(() => {
     })
     .on('error', () => {});
 }, 250);
+
+// Sheet files while recording: each is rewritten (temp file, rename) as tiles are added, so its size grows.
+const watch = setInterval(() => {
+  if (stopping) return;
+  for (const f of readdirSync(sheetDir).filter((name) => name.endsWith('.jpg'))) {
+    const sizes = (session.sheetSizes[f] ??= []);
+    const size = statSync(join(sheetDir, f), { throwIfNoEntry: false })?.size ?? 0;
+    if (sizes.at(-1) !== size) sizes.push(size);
+  }
+}, 500);
 
 // Top-level MP4 boxes. A finalised Hybrid MP4 is ftyp, mdat, moov; one that was not still has its moof fragments.
 function topLevelBoxes(file) {
@@ -176,6 +218,83 @@ function check() {
     }
   }
 
+  // ---- H2 ----
+  expect('info.features has H2', ['preview', 'thumbnail'].every((f) => features.includes(f)), features.join(','));
+  expect('starting.preview and starting.thumbnail', starting?.preview === true && starting?.thumbnail === true,
+    `preview=${starting?.preview} thumbnail=${starting?.thumbnail}`);
+
+  const previews = session.previews;
+  const firsts = new Set(previews.map((p) => p.firstWallMs));
+  expect('preview events', previews.length > 0 && firsts.size === 1 && previews.every((p) => p.intervalMs === preview.intervalMs),
+    `${previews.length} events, firstWallMs ${[...firsts].join(',')}`);
+  // Tile 0 is the first frame after start: within a second of the vod's first frame.
+  if (first && previews[0]) {
+    const fromStart = previews[0].firstWallMs - (first.wallMs - first.ptsSec * 1000);
+    expect('firstWallMs near the vod start', Math.abs(fromStart) < 1000, `tile 0 at ${fromStart.toFixed(1)} ms from file time 0`);
+  }
+  // Written every flushTiles tiles: one event per flushTiles * intervalMs while recording.
+  const during = previews.filter((p) => !session.stopSentAt || p.receivedAt < session.stopSentAt);
+  const eventGaps = during.slice(1).map((p, i) => (p.receivedAt - during[i].receivedAt) / 1000);
+  const sortedGaps = [...eventGaps].sort((a, b) => a - b);
+  const medianGap = sortedGaps[Math.floor(sortedGaps.length / 2)];
+  const flushSec = (preview.flushTiles * preview.intervalMs) / 1000;
+  expect('preview every flushTiles * intervalMs', eventGaps.length > 0 && Math.abs(medianGap - flushSec) < 0.5,
+    `median gap ${medianGap?.toFixed(3)} s for ${flushSec} s`);
+  const perSheet = preview.columns * preview.rows;
+  expect('preview tiles step by flushTiles', during.every((p) => p.tiles % preview.flushTiles === 0 || p.tiles % perSheet === 0),
+    during.map((p) => p.tiles).join(','));
+  expect('preview.sheet and file match its tiles', previews.every((p) => p.sheet === Math.floor((p.tiles - 1) / perSheet)
+    && p.file === slash(join(sheetDir, `${preview.prefix}_${String(p.sheet).padStart(6, '0')}.jpg`))));
+
+  const lastPreview = previews.at(-1);
+  if (!eof) {
+    expect('stopped.tiles is the last preview tiles', stopped?.tiles === lastPreview?.tiles, `stopped.tiles=${stopped?.tiles}`);
+    expect('last preview before stopped', lastPreview && stopped && lastPreview.receivedAt <= stopped.receivedAt);
+    if (lastPreview && stopped?.endWallMs) {
+      // Tiles stop when stop is asked, a little before the video ends: at most one tile short of the end.
+      const expected = Math.floor((stopped.endWallMs - lastPreview.firstWallMs) / preview.intervalMs) + 1;
+      expect('stopped.tiles matches the duration', stopped.tiles <= expected && stopped.tiles >= expected - 1,
+        `${stopped.tiles} tiles, ${expected} for ${((stopped.endWallMs - lastPreview.firstWallMs) / 1000).toFixed(3)} s`);
+    }
+  }
+  const sheets = readdirSync(sheetDir).filter((f) => f.endsWith('.jpg')).sort();
+  expect('one sheet per started grid', lastPreview && sheets.length === Math.ceil(lastPreview.tiles / perSheet), sheets.join(','));
+  expect('no temp file left', !readdirSync(sheetDir).some((f) => f.endsWith('.tmp')) && !existsSync(thumbnail + '.tmp'));
+  const grew = Object.entries(session.sheetSizes).filter(([, sizes]) => sizes.filter((n) => n > 0).length > 1);
+  expect('sheets grow while recording', grew.length > 0,
+    Object.entries(session.sheetSizes).map(([f, sizes]) => `${f}: ${sizes.join(' ')}`).join('; '));
+
+  const autoThumb = session.events.find((e) => e.event === 'thumbnail' && e.id === undefined);
+  expect('automatic thumbnail', autoThumb?.path === slash(thumbnail) && first && Math.abs(autoThumb.wallMs - first.wallMs) < 1000,
+    autoThumb ? `wallMs ${(autoThumb.wallMs - first?.wallMs).toFixed(1)} ms from the first anchor` : 'missing');
+  const commandThumb = session.events.find((e) => e.event === 'thumbnail' && e.id === 4);
+  if (session.thumbnailSentAt) {
+    const latency = commandThumb ? commandThumb.receivedAt - session.thumbnailSentAt : NaN;
+    session.thumbnailCommandMs = latency;
+    expect('thumbnail command', commandThumb?.path === slash(thumbnail) && latency < 50, `${latency} ms command to reply (budget 50)`);
+  }
+  // After EOF nothing can be asked any more.
+  if (!eof) expect('thumbnail refused when not recording',
+    session.events.some((e) => e.event === 'error' && e.cmd === 'thumbnail' && e.id === 5 && e.message === 'not recording'));
+  expect('thumbnail file', existsSync(thumbnail) && statSync(thumbnail).size > 0);
+
+  if (ffprobe && existsSync(ffprobe)) {
+    const probeImage = (file) => {
+      const probe = spawnSync(ffprobe, ['-v', 'error', '-show_entries', 'stream=codec_name,width,height', '-of', 'json', file]);
+      return JSON.parse(probe.stdout.toString() || '{}').streams?.[0];
+    };
+    const sheetW = preview.columns * preview.tileWidth;
+    const sheetH = preview.rows * preview.tileHeight;
+    const probed = sheets.map((f) => ({ f, s: probeImage(join(sheetDir, f)) }));
+    expect('sheets are JPEGs of the grid size',
+      probed.length > 0 && probed.every(({ s }) => s?.codec_name === 'mjpeg' && s.width === sheetW && s.height === sheetH),
+      probed.map(({ f, s }) => `${f} ${s?.codec_name} ${s?.width}x${s?.height} ${statSync(join(sheetDir, f)).size} B`).join('; '));
+    const t = existsSync(thumbnail) ? probeImage(thumbnail) : undefined;
+    expect('thumbnail is a JPEG of its size',
+      t?.codec_name === 'mjpeg' && t.width === thumbnailSize.width && t.height === thumbnailSize.height,
+      `${t?.codec_name} ${t?.width}x${t?.height} ${existsSync(thumbnail) ? statSync(thumbnail).size : 0} B`);
+  }
+
   for (const r of results) console.log(`[test] ${r.ok ? 'ok  ' : 'FAIL'} ${r.name}${r.detail ? `: ${r.detail}` : ''}`);
   session.checks = results;
   return results.every((r) => r.ok);
@@ -183,6 +302,7 @@ function check() {
 
 proc.on('exit', (code) => {
   clearInterval(poll);
+  clearInterval(watch);
   const ok = check();
   writeFileSync(join(outDir, 'session.json'), JSON.stringify(session, null, 2));
   const hooked = session.events.some((e) => e.event === 'hooked');

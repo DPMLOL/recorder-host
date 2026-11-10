@@ -10,15 +10,18 @@ find_package(libobs REQUIRED CONFIG)
 add_executable(recorder-host
   src/audio_apps.cpp
   src/audio_tracks.cpp
+  src/jpeg.cpp
   src/loudness.cpp
   src/main.cpp
+  src/preview.cpp
   src/protocol.cpp
   src/recorder.cpp
   src/wall_clock.cpp
 )
 target_compile_features(recorder-host PRIVATE cxx_std_20)
 target_compile_definitions(recorder-host PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(recorder-host PRIVATE OBS::libobs)
+# windowscodecs: JPEG encoding through WIC, part of Windows.
+target_link_libraries(recorder-host PRIVATE OBS::libobs windowscodecs ole32)
 
 # The host must sit next to obs.dll so libobs finds its plugins and data through its default relative paths.
 install(TARGETS recorder-host RUNTIME DESTINATION bin/64bit)
