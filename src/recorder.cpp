@@ -193,6 +193,9 @@ bool Recorder::reset_video(uint32_t width, uint32_t height, uint32_t fps) {
     blog(LOG_ERROR, "obs_reset_video failed: %d", result);
     return false;
   }
+  // The OBS frontend sets these (its defaults); libobs leaves them at 0, which turns an HDR monitor black: its
+  // capture is tonemapped to SDR with a multiplier of 80 / sdr_white_level.
+  obs_set_video_levels(300.f, 1000.f);
   width_ = width;
   height_ = height;
   fps_ = fps;
