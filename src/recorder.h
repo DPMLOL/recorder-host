@@ -4,6 +4,7 @@
 
 #include <obs.hpp>
 
+#include <chrono>
 #include <mutex>
 #include <string>
 
@@ -38,6 +39,7 @@ class Recorder {
   obs_source_t *create_video_source(obs_data_t *video, std::string &error);
   static const char *pick_video_encoder(const char *requested);
   bool start_output(OutputSlot &slot, const char *type, obs_data_t *settings, std::string &error);
+  void stop_outputs(std::chrono::seconds timeout);
 
   void close_segment(double end_wall_ms);
 
@@ -63,6 +65,14 @@ class Recorder {
 
   // Written on the output thread (packets, file changes), read at stop.
   std::mutex clock_mutex_;
+  // The output anchors and progress are measured on: the vod when there is one, else the ring.
+  const OutputSlot *clock_ = nullptr;
+  // When stop was asked (os_gettime_ns): the muxers drop every packet decoded from then on.
+  uint64_t stop_ns_ = 0;
+  // On the clock output: wall clock of file time 0, and the decode times its video spans.
+  double file_start_wall_ms_ = 0;
+  double first_dts_sec_ = 0;
+  double last_dts_sec_ = 0;
   long long keyframes_ = 0;
   bool anchored_ = false;
   double last_keyframe_wall_ms_ = 0;
