@@ -1,6 +1,7 @@
 #pragma once
 
 #include "audio_tracks.h"
+#include "clip.h"
 #include "hook_signature.h"
 #include "preview.h"
 
@@ -34,6 +35,7 @@ class Recorder {
   void set_volume(long long id, obs_data_t *params);
   void loudness(long long id, obs_data_t *params);
   void thumbnail(long long id, obs_data_t *params);
+  void clip(long long id, obs_data_t *params);
   void audio_apps(long long id);
   void release_session();
   bool recording() const;
@@ -70,6 +72,9 @@ class Recorder {
   std::string vod_path_;
   // Preview tiles, Sprite sheets and Thumbnails, grabbed on the GPU while recording.
   Preview preview_;
+  // `clip` commands, cut one at a time on a background thread; independent of the recording.
+  Clipper clipper_{on_clipped};
+  static void on_clipped(const ClipJob &job, const ClipResult &result);
 
   // Written on the output thread (packets, file changes), read at stop.
   std::mutex clock_mutex_;
