@@ -1,13 +1,15 @@
 // In-game spike: records League through game_capture as a vod only (no ring), samples the Live Client API game
-// clock so the anchor can be checked against the HUD timer afterwards, and checks the protocol 2 basics (H1) and the
-// Preview tiles, Sprite sheets and Thumbnails (H2).
+// clock so the anchor can be checked against the HUD timer afterwards, and checks the protocol basics (H1), the
+// Preview tiles, Sprite sheets and Thumbnails (H2), and Clips (H3): two cut from the vod while it is written (its
+// start, and seconds just before the last progress), the second cut again from the finalised vod, and the errors.
 //   node scripts/ingame-test.mjs [--seconds 120] [--mic <deviceId>] [--out <dir>] [--source game|monitor] [--eof]
 //                                [--columns 10] [--rows 10]
 // --source monitor records the screen instead (no game needed, nothing injected). --eof closes stdin instead of
 // sending stop, as a crashed app would: the vod must still be finalised.
 // --columns and --rows set the Sprite sheet grid (a small one checks the move to the next sheet in a short run).
-// Ctrl+C stops early. Writes <out>/ingame.mp4, <out>/sheets/sheet_*.jpg, <out>/thumbnail.jpg, <out>/session.json.
-// Probes the vod, the sheets and the Thumbnail with obs-deps' ffprobe if built.
+// Ctrl+C stops early. Writes <out>/ingame.mp4, <out>/sheets/sheet_*.jpg, <out>/thumbnail.jpg, <out>/clips/*.mp4,
+// <out>/session.json. Probes the vod, the sheets, the Thumbnail and the Clips with obs-deps' ffprobe if built.
+// Needs --seconds 20 or more for the live Clips.
 import { spawn, spawnSync } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import https from 'node:https';
@@ -43,6 +45,12 @@ rmSync(sheetDir, { recursive: true, force: true });
 mkdirSync(sheetDir, { recursive: true });
 const thumbnail = join(outDir, 'thumbnail.jpg');
 rmSync(thumbnail, { force: true });
+const clipDir = join(outDir, 'clips');
+rmSync(clipDir, { recursive: true, force: true });
+// Clip ids: 10 the vod's start and 11 just before the last progress, both live; 12 the range of 11 from the
+// finalised vod; 13 an empty range; 14 a missing source.
+const clipPath = (id) => join(clipDir, `clip_${id}.mp4`);
+const clipsAsked = {};
 const slash = (path) => path.replace(/\\/g, '/');
 const host = join(root, 'build', 'obs-install', 'bin', '64bit', 'recorder-host.exe');
 
@@ -86,12 +94,39 @@ createInterface({ input: proc.stdout }).on('line', (line) => {
       session.thumbnailSentAt = Date.now();
       send({ cmd: 'thumbnail', id: 4 });
     }, (seconds * 1000) / 2);
+    // Clips of the vod being written, at two thirds of the run, from the last progress in file time.
+    setTimeout(() => {
+      const first = session.anchors[0];
+      const last = session.progress.at(-1);
+      if (stopping || !first || !last) return;
+      const t = (last.endWallMs - (first.wallMs - first.ptsSec * 1000)) / 1000;
+      clip(10, vod, 0.5, 3);
+      clip(11, vod, Math.max(0, t - 8), t - 3);
+      clip(13, vod, 5, 5);
+      clip(14, join(outDir, 'missing.mp4'), 0, 5);
+    }, (seconds * 1000 * 2) / 3);
   }
   if (ev.event === 'error' && ev.cmd === 'start') send({ cmd: 'shutdown' });
-  // Asked once nothing records: must be refused.
-  if (ev.event === 'stopped') send({ cmd: 'thumbnail', id: 5 });
-  if (ev.event === 'error' && ev.cmd === 'thumbnail' && ev.id === 5) send({ cmd: 'shutdown' });
+  // Asked once nothing records: must be refused. The finalised vod is cut once more.
+  if (ev.event === 'stopped') {
+    send({ cmd: 'thumbnail', id: 5 });
+    if (clipsAsked[11]) clip(12, vod, clipsAsked[11].fromSec, clipsAsked[11].toSec);
+  }
+  if (session.events.some((e) => e.event === 'error' && e.cmd === 'thumbnail' && e.id === 5) &&
+      Object.keys(clipsAsked).every((id) => replyTo(Number(id))) && !session.shutdownSentAt) {
+    session.shutdownSentAt = Date.now();
+    send({ cmd: 'shutdown' });
+  }
 });
+
+function clip(id, source, fromSec, toSec) {
+  clipsAsked[id] = { source, fromSec, toSec, sentAt: Date.now() };
+  send({ cmd: 'clip', id, source: slash(source), fromSec, toSec, path: slash(clipPath(id)) });
+}
+
+function replyTo(id) {
+  return session.events.find((e) => e.id === id && (e.event === 'clipped' || (e.event === 'error' && e.cmd === 'clip')));
+}
 
 function stop() {
   if (stopping) return;
@@ -158,7 +193,7 @@ function check() {
   const find = (event) => session.events.find((e) => e.event === event);
 
   const info = find('info');
-  expect('info.protocol is 2', info?.protocol === 2, `protocol=${info?.protocol}`);
+  expect('info.protocol is 3', info?.protocol === 3, `protocol=${info?.protocol}`);
   const features = info?.features ?? [];
   expect('info.features has H1', ['vod-only', 'progress', 'encoder-settings'].every((f) => features.includes(f)), features.join(','));
 
@@ -293,6 +328,66 @@ function check() {
     expect('thumbnail is a JPEG of its size',
       t?.codec_name === 'mjpeg' && t.width === thumbnailSize.width && t.height === thumbnailSize.height,
       `${t?.codec_name} ${t?.width}x${t?.height} ${existsSync(thumbnail) ? statSync(thumbnail).size : 0} B`);
+  }
+
+  // ---- H3 ----
+  expect('info.features has clip', features.includes('clip'), features.join(','));
+  const probeJson = (file, entries, extra = []) => {
+    const probe = spawnSync(ffprobe, ['-v', 'error', ...extra, '-show_entries', entries, '-of', 'json', file]);
+    return probe.status === 0 ? JSON.parse(probe.stdout.toString() || '{}') : undefined;
+  };
+  const vodStreams = ffprobe && existsSync(ffprobe) && existsSync(vod)
+    ? (probeJson(vod, 'stream=codec_type')?.streams ?? []).map((s) => s.codec_type).join(',')
+    : undefined;
+  const checkClip = (id, label) => {
+    const asked = clipsAsked[id];
+    if (!asked) {
+      expect(`clip ${label}`, false, 'not asked (run too short or stopped early)');
+      return undefined;
+    }
+    const reply = replyTo(id);
+    const ok = reply?.event === 'clipped';
+    const latency = reply ? reply.receivedAt - asked.sentAt : NaN;
+    expect(`clip ${label}`, ok && reply.path === slash(clipPath(id)) && existsSync(clipPath(id)),
+      ok ? `${latency} ms, fromSec ${reply.fromSec.toFixed(3)} for ${asked.fromSec.toFixed(3)}, ${reply.durationMs} ms`
+        : JSON.stringify(reply ?? 'no reply'));
+    if (!ok) return undefined;
+    // The keyframe at or before fromSec: never after it, never a GOP or more before it.
+    expect(`clip ${label} starts on the keyframe before fromSec`,
+      reply.fromSec <= asked.fromSec + 1e-6 && reply.fromSec > asked.fromSec - keyframeSec - 0.1);
+    const wantMs = (asked.toSec - reply.fromSec) * 1000;
+    expect(`clip ${label} durationMs covers the range`, Math.abs(reply.durationMs - wantMs) <= 100,
+      `${reply.durationMs} ms for ${wantMs.toFixed(0)} ms`);
+    expect(`clip ${label} leaves no .part`, !existsSync(clipPath(id) + '.part'));
+    if (vodStreams !== undefined) {
+      const streams = (probeJson(clipPath(id), 'stream=codec_type')?.streams ?? []).map((s) => s.codec_type).join(',');
+      expect(`clip ${label} has every stream of the vod`, streams === vodStreams, `${streams} for ${vodStreams}`);
+      const frame = probeJson(clipPath(id), 'frame=key_frame,pts_time', ['-select_streams', 'v:0', '-show_frames',
+        '-read_intervals', '%+#1'])?.frames?.[0];
+      expect(`clip ${label} decodes from its first frame`, frame?.key_frame === 1, JSON.stringify(frame));
+      const duration = Number(probeJson(clipPath(id), 'format=duration')?.format?.duration);
+      expect(`clip ${label} file duration`, Math.abs(duration * 1000 - reply.durationMs) <= 100,
+        `${duration} s for durationMs ${reply.durationMs}`);
+    }
+    return reply;
+  };
+  checkClip(10, 'of the live vod start');
+  const live = checkClip(11, 'of the live vod before the last progress');
+  if (!eof) {
+    const finalised = checkClip(12, 'of the finalised vod');
+    if (live && finalised) {
+      expect('live and finalised clips start on the same keyframe', Math.abs(live.fromSec - finalised.fromSec) < 0.002,
+        `${live.fromSec} and ${finalised.fromSec}`);
+    }
+  }
+  const errorOf = (id) => session.events.find((e) => e.event === 'error' && e.cmd === 'clip' && e.id === id);
+  if (clipsAsked[13]) expect('clip empty range refused', errorOf(13)?.message === 'empty range', errorOf(13)?.message);
+  if (clipsAsked[14]) expect('clip missing source refused', errorOf(14)?.message.startsWith('source unreadable'), errorOf(14)?.message);
+  // Cutting must not disturb the vod: no progress gap around the live Clips beyond one keyframe interval.
+  if (clipsAsked[11]) {
+    const around = session.progress.filter((p) => Math.abs(p.receivedAt - clipsAsked[11].sentAt) < 10000);
+    const worst = Math.max(0, ...around.slice(1).map((p, i) => (p.endWallMs - around[i].endWallMs) / 1000));
+    expect('progress steady while cutting', worst < keyframeSec + 0.25, `longest gap ${worst.toFixed(3)} s`);
   }
 
   for (const r of results) console.log(`[test] ${r.ok ? 'ok  ' : 'FAIL'} ${r.name}${r.detail ? `: ${r.detail}` : ''}`);

@@ -43,10 +43,11 @@ Commands (`id` is echoed back on replies and errors):
 | `loudness` | `sinceWallMs` | `loudness {loudnessLufs?, peakDb?}` of the mix since then |
 | `thumbnail` | `path?`, `width?`, `height?` (default: those of `start.thumbnail`, else 480x270) | `thumbnail {path, wallMs}` once the file is written; `error` "not recording" outside a recording |
 | `stop` | – | `stopped {vod, endWallMs?, tiles?, loudnessLufs?, peakDb?}` once every output is closed (`tiles` with `preview`) |
+| `clip` | `source`, `fromSec`, `toSec`, `path` | `clipped {path, fromSec, durationMs}` once the file is complete; works while recording or not (see Clips) |
 | `shutdown` | – | – |
 
-`info.protocol` is `2`. `info.features` lists what this host supports: `"vod-only"`, `"progress"`, `"encoder-settings"`,
-`"preview"`, `"thumbnail"`, and `"game-capture"` only when the hook is signed.
+`info.protocol` is `3`. `info.features` lists what this host supports: `"vod-only"`, `"progress"`, `"encoder-settings"`,
+`"preview"`, `"thumbnail"`, `"clip"`, and `"game-capture"` only when the hook is signed.
 
 Game capture: at init the host checks the Authenticode signature (WinVerifyTrust, no revocation check, nothing fetched)
 of the files game_capture's compatibility hook uses for a 64-bit game: `inject-helper64.exe` and `graphics-hook64.dll`,
@@ -124,6 +125,31 @@ encoding (the Windows Imaging Component, part of Windows) and file writes run on
 on the monitor (3440x1440 into 1920x1080, NVIDIA GPU, NVENC): 0.05 ms of graphics-thread time per grab (0.6 ms for the first,
 which creates the targets), 0.04 ms per readback, 3.2 ms per 1600x900 sheet, 2.6 ms per 480x270 Thumbnail, 33 ms from the
 `thumbnail` command to its reply. A 1600x900 sheet of desktop tiles is about 70 KB.
+
+### Clips
+
+`clip {source, fromSec, toSec, path}` stream-copies `[fromSec, toSec]` of the MP4 `source` (in its file time, the time
+of `anchor.ptsSec`) into a new MP4 at `path`: video and every audio track, in the source's order, no re-encoding. It
+starts on the keyframe at or before `fromSec` and keeps video packets decoded before `toSec`, so every frame decodes
+(a few frames past `toSec` with B-frames). The reply is `clipped {id, path, fromSec, durationMs}`: `fromSec` is the
+keyframe actually used, `durationMs` the Clip's length from it. Failures reply `error {cmd: "clip", id, message}`:
+`"empty range"` (`toSec` not after `fromSec`, or nothing of the source in it), `"source unreadable: ..."`,
+`"cannot write <path>: disk full"` and other write errors, `"cancelled"` / `"shutting down"` when the host stops.
+A failed Clip never touches the recording.
+
+`source` may be the vod of the running recording. A Hybrid MP4 being written is ftyp, a moov without samples, then one
+moof + mdat per GOP: the host reads only the fragments whose mdat is entirely on disk (always before the last
+`progress`), and starts reading at the fragment holding `fromSec` instead of the top of the file (the fragments before it
+are hidden behind a `free` box, so the demuxer skips them without reading). A Clip of a running vod and of the same vod
+once finalised start on the same keyframe; their audio may sit 5 ms apart, because mp4_output writes the AAC priming
+delay only in the final moov.
+
+Clips are cut one at a time, in the order asked, on a thread of their own in background mode (lowest CPU and I/O
+priority), with the FFmpeg libraries libobs already ships (libavformat). The file is written to `<path>.part`, the moov
+moved to the front (`faststart`), then renamed over `path`; a missing folder is created. Closing stdin or `shutdown`
+cancels the Clip being cut (its `.part` is deleted) and fails the queued ones. Measured 2026-11-17 (`ingame-test.mjs
+--source monitor`, NVENC 1080p60): 60 to 170 ms for a 3 to 7 s Clip of the running vod, ~0.9 s for 59 s
+(150 MB), with no gap in `progress` while cutting.
 
 ### Anchor
 

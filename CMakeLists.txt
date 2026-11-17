@@ -6,10 +6,14 @@ set(OBS_INSTALL_DIR "${CMAKE_SOURCE_DIR}/build/obs-install" CACHE PATH "OBS inst
 file(GLOB OBS_DEPS_DIR "${CMAKE_SOURCE_DIR}/obs-studio/.deps/obs-deps-20*-x64")
 list(APPEND CMAKE_PREFIX_PATH "${OBS_INSTALL_DIR}/cmake" ${OBS_DEPS_DIR})
 find_package(libobs REQUIRED CONFIG)
+# The FFmpeg libraries libobs already ships (obs-deps): `clip` stream-copies with libavformat.
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/obs-studio/cmake/finders")
+find_package(FFmpeg REQUIRED COMPONENTS avformat avcodec avutil)
 
 add_executable(recorder-host
   src/audio_apps.cpp
   src/audio_tracks.cpp
+  src/clip.cpp
   src/hook_signature.cpp
   src/jpeg.cpp
   src/loudness.cpp
@@ -22,7 +26,8 @@ add_executable(recorder-host
 target_compile_features(recorder-host PRIVATE cxx_std_20)
 target_compile_definitions(recorder-host PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 # windowscodecs: JPEG encoding through WIC, part of Windows. wintrust: the graphics hook's signature check.
-target_link_libraries(recorder-host PRIVATE OBS::libobs windowscodecs ole32 wintrust)
+target_link_libraries(recorder-host PRIVATE OBS::libobs FFmpeg::avformat FFmpeg::avcodec FFmpeg::avutil windowscodecs
+                                            ole32 wintrust)
 
 # The host must sit next to obs.dll so libobs finds its plugins and data through its default relative paths.
 install(TARGETS recorder-host RUNTIME DESTINATION bin/64bit)

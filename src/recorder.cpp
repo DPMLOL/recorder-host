@@ -24,7 +24,7 @@ constexpr long long kKeyframesPerAnchorCheck = 30;
 constexpr auto kStopTimeout = std::chrono::seconds(30);
 // Closing stdin: the parent is gone, so the vod is finalised quickly or not at all.
 constexpr auto kShutdownStopTimeout = std::chrono::seconds(5);
-constexpr long long kProtocol = 2;
+constexpr long long kProtocol = 3;
 
 // Outputs signal their stop from their own threads; stop() waits for all of them here.
 std::mutex stop_mutex;
@@ -110,6 +110,8 @@ bool Recorder::init() {
 }
 
 void Recorder::shutdown() {
+  // The Clip being cut is cancelled (its `.part` deleted) and queued ones fail: the vod comes first.
+  clipper_.stop();
   // A normal stop, as `stop` does, waited for: a forced one finalises the vod only if a packet still arrives
   // before the teardown below, and loses what libobs had buffered.
   if (recording()) {
@@ -143,6 +145,8 @@ void Recorder::handle(obs_data_t *command) {
     audio_apps(id);
   } else if (strcmp(cmd, "thumbnail") == 0) {
     thumbnail(id, command);
+  } else if (strcmp(cmd, "clip") == 0) {
+    clip(id, command);
   } else {
     protocol::send_error(cmd, id, "unknown command");
   }
@@ -177,9 +181,9 @@ void Recorder::info(long long id) {
 
   if (hook_.trusted) {
     protocol::send(event, "features",
-                   {"vod-only", "progress", "encoder-settings", "preview", "thumbnail", "game-capture"});
+                   {"vod-only", "progress", "encoder-settings", "preview", "thumbnail", "clip", "game-capture"});
   } else {
-    protocol::send(event, "features", {"vod-only", "progress", "encoder-settings", "preview", "thumbnail"});
+    protocol::send(event, "features", {"vod-only", "progress", "encoder-settings", "preview", "thumbnail", "clip"});
   }
 }
 
@@ -608,6 +612,40 @@ void Recorder::thumbnail(long long id, obs_data_t *params) {
   } else if (!preview_.thumbnail(id, params, error)) {
     protocol::send_error("thumbnail", id, error);
   }
+}
+
+// A Clip of any MP4, the vod being recorded included: queued and cut on the Clipper's thread, replied to from there.
+void Recorder::clip(long long id, obs_data_t *params) {
+  ClipJob job;
+  job.id = id;
+  job.source = obs_data_get_string(params, "source");
+  job.path = obs_data_get_string(params, "path");
+  job.from_sec = obs_data_get_double(params, "fromSec");
+  job.to_sec = obs_data_get_double(params, "toSec");
+  if (job.source.empty() || job.path.empty() || !obs_data_has_user_value(params, "fromSec") ||
+      !obs_data_has_user_value(params, "toSec")) {
+    protocol::send_error("clip", id, "clip needs source, fromSec, toSec and path");
+  } else if (_stricmp(job.source.c_str(), job.path.c_str()) == 0) {
+    protocol::send_error("clip", id, "path is the source");
+  } else if (!(job.to_sec > job.from_sec)) {
+    protocol::send_error("clip", id, "empty range");
+  } else {
+    clipper_.push(std::move(job));
+  }
+}
+
+void Recorder::on_clipped(const ClipJob &job, const ClipResult &result) {
+  if (!result.ok) {
+    protocol::send_error("clip", job.id, result.message);
+    return;
+  }
+  OBSDataAutoRelease event = obs_data_create();
+  obs_data_set_string(event, "event", "clipped");
+  obs_data_set_int(event, "id", job.id);
+  obs_data_set_string(event, "path", job.path.c_str());
+  obs_data_set_double(event, "fromSec", result.from_sec);
+  obs_data_set_int(event, "durationMs", result.duration_ms);
+  protocol::send(event);
 }
 
 void Recorder::audio_apps(long long id) {
